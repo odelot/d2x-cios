@@ -1,0 +1,94 @@
+#!/bin/bash
+#
+# Pre-commit hook for d2x-cios
+# Verifies that the project builds successfully before allowing commit
+#
+
+set -e
+
+echo "Running pre-commit build verification for d2x-cios..."
+echo ""
+
+# Check if Docker is available
+if ! command -v docker &> /dev/null; then
+    echo "ERROR: Docker is not installed or not in PATH"
+    echo "Docker is required to build d2x-cios"
+    exit 1
+fi
+
+# Check if devkitarm-r32 image exists, build it if needed
+if ! docker image inspect devkitarm-r32 &> /dev/null; then
+    echo "Docker image 'devkitarm-r32' not found"
+    echo "Building devkitARM r32 container from submodule..."
+    echo ""
+
+    # Get project root for submodule path
+    PROJECT_ROOT_FOR_SUBMODULE=$(git rev-parse --show-toplevel)
+
+    # Ensure submodule is initialized
+    if [ ! -d "$PROJECT_ROOT_FOR_SUBMODULE/docker/devkitarm-r32/Dockerfiles" ]; then
+        echo "Initializing git submodules..."
+        git -C "$PROJECT_ROOT_FOR_SUBMODULE" submodule update --init --recursive
+    fi
+
+    # Default to Ubuntu Focal (20.04 LTS) - widely supported and modern
+    DOCKERFILE_DIR="$PROJECT_ROOT_FOR_SUBMODULE/docker/devkitarm-r32/Dockerfiles/ubuntufocal"
+
+    # Allow override via environment variable
+    if [ -n "$DEVKITARM_R32_DISTRO" ]; then
+        DOCKERFILE_DIR="$PROJECT_ROOT_FOR_SUBMODULE/docker/devkitarm-r32/Dockerfiles/$DEVKITARM_R32_DISTRO"
+        if [ ! -d "$DOCKERFILE_DIR" ]; then
+            echo "ERROR: Distribution '$DEVKITARM_R32_DISTRO' not found"
+            echo "Available: debianbullseye, ubuntufocal, ubuntujammy, etc."
+            exit 1
+        fi
+    fi
+
+    echo "Using Dockerfile from: $(basename $DOCKERFILE_DIR)"
+
+    # Build the Docker image from submodule
+    if docker build -t devkitarm-r32 "$DOCKERFILE_DIR"; then
+        echo ""
+        echo "âœ“ Docker image built successfully"
+        echo ""
+    else
+        echo ""
+        echo "ERROR: Failed to build devkitarm-r32 Docker image"
+        echo "To use a different base distribution, set DEVKITARM_R32_DISTRO environment variable"
+        echo "Example: export DEVKITARM_R32_DISTRO=debianbullseye"
+        echo ""
+        echo "Or skip this check with: git commit --no-verify"
+        exit 1
+    fi
+fi
+
+# Get the project root (where .git is located)
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
+
+echo "Building d2x-cios with devkitARM r32..."
+echo "Project directory: $PROJECT_ROOT"
+echo ""
+
+# Run the build in Docker, overriding entrypoint and compiling stripios
+if docker run --rm --entrypoint bash -v "$PROJECT_ROOT:/build" devkitarm-r32 -c "
+    cd /build && \
+    g++ -O2 -o stripios stripios_src/main.cpp && \
+    export PATH=/opt/devkitARM/bin:\$PATH && \
+    export DEVKITARM=/opt/devkitARM && \
+    ./maked2x.sh clean > /dev/null 2>&1 && \
+    ./maked2x.sh 999 pre-commit-test 2>&1 && \
+    ./maked2x.sh clean > /dev/null 2>&1
+"; then
+    echo ""
+    echo "âœ“ Build successful - commit allowed"
+    echo ""
+
+    exit 0
+else
+    echo ""
+    echo "âœ— Build failed - commit rejected"
+    echo ""
+    echo "Please fix the build errors before committing."
+    echo "To skip this check, use: git commit --no-verify"
+    exit 1
+fi

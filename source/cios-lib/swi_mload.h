@@ -34,6 +34,19 @@ typedef s32(*TRCheckFunc)(s32 tid, u32 rights);
 /* Macros */
 #define Swi_SetRegister(A, V)                         Swi_MLoad(  5, (A), (V), 0)
 #define Swi_ClearRegister(A, V)                       Swi_MLoad(  6, (A), (V), 0)
+/* Atomic EXI DATA+CR write — writes both registers back-to-back inside
+ * the SVC handler (IRQs masked), avoiding the multi-CR-write corruption
+ * we hit when DATA and CR went through two separate SWI calls with IRQs
+ * re-enabled in between. CHAN=0..2, DATA_VAL = up to 4 bytes packed BE,
+ * CR_VAL must include TSTART and encode TLEN+RW. */
+#define Swi_ExiDataCr(CHAN, DATA_VAL, CR_VAL)         Swi_MLoad(  7, (CHAN), (DATA_VAL), (CR_VAL))
+/* Atomic EXI CR-trigger + bounded-poll + DATA-read. Mirror of
+ * Swi_ExiDataCr but for the read path: the kernel handler keeps IRQs
+ * masked through the entire trigger → completion → sample window so
+ * nothing can disturb the EXI bus between the moment the transfer
+ * finishes and the DATA register is captured. Returns the 4-byte
+ * DATA contents packed big-endian (top byte = first byte read). */
+#define Swi_ExiCrRead(CHAN, CR_VAL)                   Swi_MLoad(  8, (CHAN), (CR_VAL), 0)
 #define Swi_GetSyscallBase()                          Swi_MLoad( 17,   0,   0, 0)
 #define Swi_SetRunningTitle(V)                        Swi_MLoad( 32, (V),   0, 0)
 #define Swi_GetRunningTitle()                         Swi_MLoad( 33,   0,   0, 0)

@@ -1,0 +1,3 @@
+[submodule "docker/devkitarm-r32"]
+	path = docker/devkitarm-r32
+	url = https://github.com/Leseratte10/compile-devkitARM-r32.git
