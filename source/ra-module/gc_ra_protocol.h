@@ -166,14 +166,31 @@ typedef enum {
      * ESP32 evicted dynamic addresses (LRU) and tells ra-module to TRUNCATE
      * its local watchlist to `keep_count` entries. ra-module discards
      * ra_watchlist[keep_count..ra_watchlist_count-1] and updates its count.
-     * Payload: ra_watchlist_truncate_t (u16 keep_count, BE). The initial
-     * static watchlist (entries [0..static_count-1]) is NEVER evicted, so
-     * keep_count >= static_count is guaranteed by the ESP32 side.
-     * Parse MUST be in both ra_send_snapshot AND ra_send_addr_response
-     * (twin function divergence hazard — see ESP32 memory file
-     * project_ra_send_addr_response_missing_branch).
+     * DEPRECATED in favor of RA_EVT_WATCHLIST_REMOVE — TRUNCATE drops the
+     * tail wholesale which would evict byte-fanouts of static base addresses
+     * along with stale chain leaves, breaking trigger evaluation.
      */
     RA_EVT_WATCHLIST_TRUNCATE = 0x0C,
+
+    /**
+     * ESP32 evicted specific addresses (LRU-selected) and tells ra-module
+     * to remove them from its local watchlist. ra-module finds each address
+     * by linear scan in ra_watchlist[], removes by shifting remaining entries
+     * down (defrag — preserves insertion order of survivors). Both sides
+     * arrive at identical compacted arrays.
+     *
+     * Payload: ra_watchlist_remove_t (u16 addr_count, BE) followed by
+     * addr_count × u32 addresses (BE).
+     *
+     * Insertion order on both sides must match — ESP32 evicts the same
+     * addresses on its side BEFORE sending REMOVE, so the resulting
+     * compacted arrays match position-by-position. SNAPSHOT memcpy depends
+     * on this alignment.
+     *
+     * Parse MUST be in both ra_send_snapshot AND ra_send_addr_response
+     * (twin function divergence hazard).
+     */
+    RA_EVT_WATCHLIST_REMOVE  = 0x0D,
 } ra_esp_event_t;
 
 /**
@@ -308,13 +325,21 @@ typedef struct __attribute__((packed)) {
 
 /**
  * RA_EVT_WATCHLIST_TRUNCATE data — single u16 telling ra-module the
- * new watchlist length. Entries [keep_count..ra_watchlist_count-1] are
- * dropped. No address list follows (ra-module's watchlist is identical
- * to ESP32's by insertion order, so just shrinking by index is enough).
+ * new watchlist length. DEPRECATED — see RA_EVT_WATCHLIST_REMOVE.
  */
 typedef struct __attribute__((packed)) {
     uint16_t keep_count;
 } ra_watchlist_truncate_t;
+
+/**
+ * RA_EVT_WATCHLIST_REMOVE data — addr_count followed by addr_count u32
+ * addresses (BE). ra-module locates each address in ra_watchlist[] and
+ * removes it (shifts subsequent entries down). Insertion order of survivors
+ * preserved on both sides so SNAPSHOT positions stay aligned.
+ */
+typedef struct __attribute__((packed)) {
+    uint16_t addr_count;
+} ra_watchlist_remove_t;
 
 /**
  * RA_CMD_ADDR_RESPONSE data

@@ -106,17 +106,23 @@ void exi_init(void) {
 	 * us the diagnostic signal. */
 }
 
-/* CSR bit layout (per Hollywood EXI):
- *   bit 0  EXTINT     external interrupt
- *   bit 1  EXT        external (memcard inserted)
- *   bit 2  TC         transfer complete (RW1C)
- *   bit 3  TCINT      transfer complete interrupt enable
+/* CSR bit layout (per Hollywood EXI, verified against libogc/libogc/exi.c).
+ * Earlier draft had bit 0/1 wrong; correct layout is:
+ *   bit 1  EXI_IRQ    device-asserted INT pin pending (0x0002, RW1C)
+ *   bit 3  TC_IRQ     transfer complete (0x0008, RW1C)
  *   bit 4..6  CLK     frequency (0..5)
  *   bit 7..9  CS      chip select (one bit per device 0..2)
- *   bit 10 EXIINT
- * Write the CSR directly — DO NOT read-modify-write. gecko.c overwrites it
- * and the consensus is that the "interrupt" bits should not be carried
- * over from a previous transaction. */
+ *   bit 11 EXT_IRQ    card insert/remove edge IRQ (0x0800, RW1C)
+ *   bit 12 EXT_BIT    card present (0x1000, level)
+ *
+ * IRQ bits are write-1-to-clear: writing 0 leaves them unchanged. Our
+ * build_csr leaves all three IRQ bits zero, so exi_select does NOT clear
+ * a pending INT. That's intentional — Phase B relies on the INT bit
+ * sitting latched in the CSR until we explicitly clear it. */
+#define EXI_CSR_EXI_IRQ  0x0002u
+#define EXI_CSR_TC_IRQ   0x0008u
+#define EXI_CSR_EXT_IRQ  0x0800u
+
 static u32 build_csr(s32 dev, s32 freq) {
 	return (freq & 0x70) | (1u << (dev + 7));
 }
@@ -265,4 +271,39 @@ s32 exi_transaction(s32 chan, s32 dev, s32 freq,
 out:
 	exi_deselect(chan);
 	return ret;
+}
+
+/* ---------- Phase B device-INT handshake ----------
+ *
+ * ESP32 drives slot pin 2 (INT) low when it has prepared a response.
+ * Hollywood's EXI controller latches EXI_CSR bit 1 (EXI_EXI_IRQ) on the
+ * falling edge. The latch is sticky — stays set until we write 1 to it.
+ *
+ * No need to UnmaskIrq the EXI IRQ in the Starlet IRQ controller; we
+ * poll the CSR directly. Avoids fighting libogc on PPC if it ever
+ * attaches an EXI IRQ handler post-IOS-reload. */
+
+s32 exi_wait_int(s32 chan, u32 timeout_ms) {
+	u32 spins = 0, yields = 0;
+	if (chan < 0 || chan > 2) return -1;
+	while (!(r32(EXI_CSR(chan)) & EXI_CSR_EXI_IRQ)) {
+		if (++spins >= SPINS_BEFORE_YIELD) {
+			spins = 0;
+			if (++yields >= timeout_ms) return -1;
+			ra_sleep(1);
+		}
+	}
+	return 0;
+}
+
+void exi_clear_int(s32 chan) {
+	u32 csr;
+	if (chan < 0 || chan > 2) return;
+	csr = r32(EXI_CSR(chan));
+	/* Mask out all three RW1C IRQ bits so we don't accidentally clear
+	 * a TC_IRQ or EXT_IRQ pending alongside, then OR in the one we DO
+	 * want to clear. Mirrors libogc's __exi_clearirqs pattern. */
+	csr &= ~(EXI_CSR_EXI_IRQ | EXI_CSR_TC_IRQ | EXI_CSR_EXT_IRQ);
+	csr |= EXI_CSR_EXI_IRQ;
+	w32(EXI_CSR(chan), csr);
 }

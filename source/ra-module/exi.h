@@ -50,4 +50,20 @@ s32  exi_transaction(s32 chan, s32 dev, s32 freq,
 s32  exi_dma_transaction(s32 chan, s32 dev, s32 freq,
                          const void *data, u32 len);
 
+/* --- Phase B: device-INT handshake (slot pin 2 → ESP32 GPIO14) ---
+ *
+ * After ESP32 receives a request and prepares the response in its tx_buf,
+ * it pulls slot pin 2 (INT) low. The Hollywood EXI controller latches
+ * EXI_CSR bit 1 (EXI_EXI_IRQ, 0x002, RW1C, edge-triggered + sticky).
+ *
+ * exi_wait_int: poll EXI_CSR for the latched INT, with timeout in ms.
+ *   Returns 0 on success, -1 on timeout. Does NOT clear the bit.
+ *
+ * exi_clear_int: write-1-to-clear the EXI_EXI_IRQ bit. Call AFTER
+ *   exi_wait_int returns success, BEFORE the response read CS-low.
+ *
+ * See project_phase_b_design memory for protocol details. */
+s32  exi_wait_int(s32 chan, u32 timeout_ms);
+void exi_clear_int(s32 chan);
+
 #endif
