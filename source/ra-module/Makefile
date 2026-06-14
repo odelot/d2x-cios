@@ -27,6 +27,7 @@ TARGET	=	ra-module
 OBJS	=	start.o \
 		main.o \
 		exi.o \
+		vi.o \
 		led.o
 
 

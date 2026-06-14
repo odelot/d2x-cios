@@ -16,8 +16,30 @@
 #include "timer.h"
 
 #include "exi.h"
+#include "vi.h"
 #include "led.h"
 #include "gc_ra_protocol.h"
+
+/* Feature toggle. Three modes selectable at build time:
+ *
+ *   USE_TIMER_PACING (default, v0.20.3+):
+ *     Hollywood HW_TIMER drives the cadence. Read tick at frame start,
+ *     do SNAPSHOT + multi-pass, sleep the residual (FRAME_US - elapsed).
+ *     Self-correcting: a slow frame doesn't drift the next one.
+ *     Independent of VI register (which v0.20.2 confirmed returns 0
+ *     constantly on this Starlet MMU map — see [[project-vi-register-
+ *     unmapped]] when written).
+ *
+ *   USE_VBLANK_SYNC (v0.20.1, currently broken):
+ *     Polls VI's vpos register via wrap-detection. Doesn't actually
+ *     work on Starlet (vpos always reads 0), so falls through to the
+ *     2-frame timeout giving ~30Hz cadence. Kept for now so we can
+ *     iterate on VI address discovery via vi_probe_addrs without
+ *     touching this path.
+ *
+ *   (neither defined):
+ *     Fixed ra_sleep(16) cadence ≈ 41Hz effective. Pre-Phase-B fallback. */
+#define USE_TIMER_PACING
 
 char *moduleName = "RA_MOD";
 
@@ -184,13 +206,20 @@ static s32 ra_send(const void *tx, u32 tx_len, void *rx, u32 rx_len)
  * tx_buf until the next real round, which pre-clears EXI_IRQ in ra_send_phase_b
  * anyway. Keeps the debug path from interfering with the SNAPSHOT timing. */
 
-static u8 ra_dbg_hex(u8 nibble)
+/* Forward declarations. ra_sleep / ra_sleep_us are defined further down
+ * but the debug helpers below need to call ra_sleep before that point. */
+void ra_sleep(s32 time_ms);
+void ra_sleep_us(s32 time_us);
+
+/* Note: helpers below are intentionally non-static — vi.c uses
+ * ra_debug_send / ra_dbg_u16_dec / ra_dbg_hex_bytes for vi_dump_state. */
+u8 ra_dbg_hex(u8 nibble)
 {
 	if (nibble < 10) return (u8)('0' + nibble);
 	return (u8)('A' + (nibble - 10));
 }
 
-static u32 ra_dbg_hex_bytes(u8 *dst, const u8 *src, u32 n, u8 sep)
+u32 ra_dbg_hex_bytes(u8 *dst, const u8 *src, u32 n, u8 sep)
 {
 	u32 j;
 	u32 o = 0;
@@ -202,7 +231,7 @@ static u32 ra_dbg_hex_bytes(u8 *dst, const u8 *src, u32 n, u8 sep)
 	return o;
 }
 
-static u32 ra_dbg_u16_dec(u8 *dst, u16 v)
+u32 ra_dbg_u16_dec(u8 *dst, u16 v)
 {
 	u8 tmp[6];
 	u32 n = 0, o = 0;
@@ -212,7 +241,7 @@ static u32 ra_dbg_u16_dec(u8 *dst, u16 v)
 	return o;
 }
 
-static void ra_debug_send(const u8 *msg, u8 msg_len)
+void ra_debug_send(const u8 *msg, u8 msg_len)
 {
 	/* Largest packet: 4 hdr + 1 len + 255 msg = 260 bytes. */
 	static u8 buf[260] __attribute__((aligned(32)));
@@ -414,6 +443,38 @@ void ra_sleep(s32 time_ms)
 	os_message_queue_destroy(q);
 }
 
+/* Sub-millisecond sleep variant. Same pattern as ra_sleep but takes
+ * microseconds directly. Used by the HW_TIMER-based pacer in the main
+ * loop: after a frame's SNAPSHOT + multi-pass work, we sleep the residual
+ * (16667us - elapsed_us) which is often a few hundred microseconds shy
+ * of a full millisecond. Calling ra_sleep(0) would no-op (and also
+ * doesn't accept sub-ms anyway).
+ *
+ * os_create_timer's first argument IS microseconds, so this is a direct
+ * pass-through. Granularity in practice depends on the IOS scheduler —
+ * likely ~10-50us at the low end. For 60Hz pacing that's plenty. */
+void ra_sleep_us(s32 time_us)
+{
+	static u32 sleep_q_buf[4] __attribute__((aligned(32)));
+	s32 q, t;
+
+	if (time_us <= 0) return;
+
+	q = os_message_queue_create(sleep_q_buf, 4);
+	if (q < 0) return;
+
+	t = os_create_timer(time_us, 0, q, 0x777);
+	if (t >= 0) {
+		u32 msg = 0;
+		while (1) {
+			os_message_queue_receive(q, &msg, 0);
+			if (msg == 0x777) break;
+		}
+		os_destroy_timer(t);
+	}
+	os_message_queue_destroy(q);
+}
+
 /* ------------------------------------------------------------------------
  * Watchlist fetch — RA_CMD_GET_WATCHLIST_CHUNK
  *
@@ -560,11 +621,6 @@ static u8 ra_snap_tx_buf[16 + RA_MAX_WATCH_ADDRS] __attribute__((aligned(32)));
  * + 128*4 = 520 bytes. 1024 gives generous headroom. */
 static u8 ra_snap_rx_buf[1024] __attribute__((aligned(32)));
 
-/* Tracks the SNAPSHOT request length so ADDR_RESPONSE pads to the same
- * width. Updated every SNAPSHOT cycle since watchlist_count can grow
- * (WATCHLIST_APPEND) or shrink (WATCHLIST_TRUNCATE) mid-session. */
-static u32 ra_canonical_tx_len = 0;
-
 /* Monotonic per-frame counter so ESP32 can detect dropped frames. */
 static u32 ra_frame_counter = 0;
 
@@ -581,13 +637,15 @@ static u8 ra_read_ppc_byte(u32 addr)
 }
 
 /* Central response parser — called by BOTH ra_send_snapshot and
- * ra_send_addr_response after their ra_send returns. Mutates global
+ * ra_send_addr_response after ra_send_phase_b returns. Mutates global
  * state (ra_pending_query_*, ra_watchlist*) as the event dictates.
  *
- * The response is at offset 0 of rx_buf because ESP32 padded its
- * prepared response with `last_snap_req_len` bytes of 0xFF that got
- * clocked through during our TX phase — by the time we begin reading
- * RX bytes, we're at the start of the actual response data. */
+ * The response lives at offset 0 of rx_buf. Under Phase B (v0.19.1+)
+ * the ESP places its prepared response at tx_buf[0] and the dedicated
+ * read CS-low clocks it out from byte 0 — no leading padding needed.
+ * (The pre-Phase-B comment here described "last_snap_req_len bytes of
+ * 0xFF" prepended for the legacy single-CS-low write+read pattern; that
+ * mechanism is gone.) */
 static void ra_parse_response(const u8 *buf)
 {
 	ra_esp_header_t resp;
@@ -660,15 +718,6 @@ static void ra_parse_response(const u8 *buf)
 			ra_debug_send(m, (u8)o);
 		}
 	}
-	else if (resp.event_type == RA_EVT_WATCHLIST_TRUNCATE) {
-		/* Deprecated event (Phase A v0.17.0) — kept parsed for backward
-		 * compat. Phase A.5 uses RA_EVT_WATCHLIST_REMOVE instead. */
-		ra_watchlist_truncate_t wt;
-		memcpy(&wt, buf + sizeof(resp), sizeof(wt));
-		if (wt.keep_count <= ra_watchlist_count) {
-			ra_watchlist_count = wt.keep_count;
-		}
-	}
 	else if (resp.event_type == RA_EVT_WATCHLIST_REMOVE) {
 		/* Phase A.5: ESP32 evicted N specific addresses (LRU). For each,
 		 * find it in ra_watchlist[] (linear search) and shift the survivors
@@ -712,19 +761,11 @@ static void ra_parse_response(const u8 *buf)
 	}
 }
 
-/* Send SNAPSHOT — read all watchlist values from PPC RAM and ship them.
- *
- * Phase B (INT-handshake) smoke test: this path uses ra_send_phase_b which
- * splits write and read into two CS-low pulses gated by the ESP's INT
- * assertion. The 1-tx arm-after-prepare delay is gone, so the ESP's
- * response can be variable-length (no canonical padding needed) — we just
- * read enough to cover the header, then the declared payload.
- *
- * ra_canonical_tx_len is no longer used for SNAPSHOT but is kept updated
- * so ra_send_addr_response (still on legacy single-CS-low Phase A path)
- * continues to pad correctly. Once the Phase B smoke test confirms the
- * SNAPSHOT path, ra_send_addr_response will be converted next and the
- * canonical-padding bookkeeping deleted entirely. */
+/* Send SNAPSHOT — read all watchlist values from PPC RAM and ship them via
+ * Phase B (INT-handshake). Two CS-low pulses: write the request, wait for
+ * the ESP's INT assertion (signaling it has armed the response), read the
+ * response. Length is natural — no canonical padding, response lands at
+ * tx_buf[0] on ESP side. */
 static s32 ra_send_snapshot(void)
 {
 	ra_gc_header_t        *hdr;
@@ -751,8 +792,6 @@ static s32 ra_send_snapshot(void)
 	}
 
 	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count;
-	ra_canonical_tx_len = tx_len;  /* still consumed by ra_send_addr_response */
-
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
@@ -763,28 +802,17 @@ static s32 ra_send_snapshot(void)
 	return 0;
 }
 
-/* Send ADDR_RESPONSE for the currently pending query — read each addr
- * from PPC RAM, build the response, ship. The response from ESP32 may
- * carry the next ADDR_QUERY round (multi-pass convergence) or
- * WATCHLIST_APPEND/REMOVE — handled by ra_parse_response.
- *
- * Phase B: uses ra_send_phase_b (INT-handshake) so there's no more
- * arm-after-prepare 1-tx delay. Canonical padding is no longer required
- * for correctness here either, but we still pad to ra_canonical_tx_len
- * because the ESP firmware's old send_padded_response path may still be
- * length-sensitive in transient code paths during Phase B rollout. Once
- * the ESP firmware drops canonical padding, this memset goes away.
- *
- * Pre-burst sleep is gone — the race it patched (ESP's "no descriptor
- * queued" window between two back-to-back writes) is impossible under
- * Phase B because the WAIT phase blocks until the ESP has explicitly
- * armed and asserted INT. No descriptor-not-ready window exists. */
+/* Send ADDR_RESPONSE for the currently pending query — read each addr from
+ * PPC RAM, build the response, ship via Phase B. The response from ESP may
+ * carry the next ADDR_QUERY round (multi-pass convergence), a
+ * WATCHLIST_APPEND, or a WATCHLIST_REMOVE — all handled by
+ * ra_parse_response. */
 static s32 ra_send_addr_response(void)
 {
 	ra_gc_header_t      *hdr;
 	ra_addr_response_t  *ar;
 	u16 count = ra_pending_query_count;
-	u32 actual_len, tx_len, rx_len;
+	u32 tx_len, rx_len;
 	s32 ret;
 	u16 i;
 	u8 *values;
@@ -805,13 +833,7 @@ static s32 ra_send_addr_response(void)
 		values[i] = ra_read_ppc_byte(ra_pending_query_addrs[i]);
 	}
 
-	actual_len = sizeof(ra_gc_header_t) + sizeof(ra_addr_response_t) + count;
-	tx_len = (actual_len > ra_canonical_tx_len) ? actual_len
-	                                            : ra_canonical_tx_len;
-	if (tx_len > actual_len) {
-		memset(ra_snap_tx_buf + actual_len, 0xFF, tx_len - actual_len);
-	}
-
+	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_addr_response_t) + count;
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
@@ -921,49 +943,161 @@ static u32 ra_poll_thread(void *arg)
 		}
 	}
 
-	/* Main SNAPSHOT loop — at ~60Hz target, send a SNAPSHOT, then drain
-	 * any ADDR_QUERY rounds before sleeping until the next frame. The
-	 * multi-pass inner loop converges within the 16ms budget for typical
-	 * cheevo workloads (1-3 rounds observed on Kirby RtDL). Iteration cap
-	 * defends against pathological cheevos that never converge. */
+	/* Main SNAPSHOT loop. Two scheduling modes selected at compile time:
+	 *
+	 *   USE_VBLANK_SYNC defined (default v0.20.0):
+	 *     Hybrid adaptive scheduler modeled on nes-ra-adapter's OAMDMA-write
+	 *     detector with time-based fallback. Polls VI's vpos register; fires
+	 *     a SNAPSHOT either (a) when vblank is detected AND enough time has
+	 *     passed since the last fire to plausibly be a new frame, or (b)
+	 *     when 2 frame-times have elapsed without VI giving us a signal
+	 *     (loading screens, mode changes, anything that suspends VI).
+	 *
+	 *     The strict/relaxed delta tuning mirrors NES: when we just fired
+	 *     via VBLANK we treat the next vblank pulse strictly (need
+	 *     >= FRAME_US - 2500 us since last frame); when we just fired via
+	 *     TIMER we relax (>= FRAME_US - 8000 us). This prevents double-fire
+	 *     when VI gives us a glitch right after we forced a timer fire.
+	 *
+	 *   USE_VBLANK_SYNC undefined:
+	 *     Fixed 16ms ra_sleep cadence (~52Hz effective). Safe fallback.
+	 *
+	 * Multi-pass inner loop is identical in both modes — drain pending
+	 * ADDR_QUERY rounds before computing next-frame timing. Cap at 12
+	 * rounds matches ESP32's ADDR_QUERY_MAX_ITERATIONS. */
+
+#define FRAME_US                16667u   /* 60Hz NTSC frame */
+
+#if defined(USE_TIMER_PACING)
+	{
+		/* Hollywood HW_TIMER-based 60Hz pacer. Reads tick at frame start,
+		 * does work, sleeps the residual. The sleep is computed each
+		 * iteration so a slow frame doesn't drift cadence — if a frame
+		 * exceeds FRAME_US, the next one starts immediately and
+		 * subsequent frames re-converge.
+		 *
+		 * Probe pass at startup: v0.20.3 added vi_probe_addrs() to scan
+		 * VI register candidates so we can find the right Starlet-side
+		 * mapping. Result goes to ra_debug_send; doesn't affect pacing. */
+		u32 next_fire_tick;
+		u32 frame_ticks;
+
+		/* vi_probe_addrs() — DISABLED v0.20.5.
+		 *
+		 * v0.20.4 testing crashed the IOS kernel: reading from
+		 * unvalidated MMIO addresses via Swi_MLoad triggered a data
+		 * abort in SVC mode. The kernel died, the game froze at
+		 * random points after boot. Same symptom class as the
+		 * 2026-05-12 EXI-physical-address incident documented in
+		 * [[project-exi-address-check]] — "game boots, Wiimote
+		 * safety screen, then hangs".
+		 *
+		 * The probe function stays defined in vi.c so it can be
+		 * re-enabled later for *carefully curated* address lists
+		 * (only addresses verified via mini sources or external
+		 * Wii hardware documentation). Not invoked from any code
+		 * path right now. */
+		/* vi_probe_addrs();  // hazardous — see [[project-vi-probe-crashed-kernel]] */
+
+		/* Pre-compute frame interval in HW_TIMER ticks. 1 tick ≈ 526.7 ns
+		 * so FRAME_US * 1000 / 527 ≈ 31626 ticks per 16667us frame.
+		 * 16667 * 1000 = 16,667,000 fits in u32 (max 4.29B). */
+		frame_ticks = (FRAME_US * 1000u) / 527u;
+
+		next_fire_tick = vi_read_hw_timer() + frame_ticks;
+
+		while (1) {
+			s32 i;
+			u32 now_tick;
+			s32 ticks_to_fire;
+
+			(void)ra_send_snapshot();
+			for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
+				(void)ra_send_addr_response();
+			}
+
+			/* Compute time remaining until next fire. Signed math handles
+			 * HW_TIMER wraparound correctly for windows much shorter than
+			 * the timer's ~37-minute period. */
+			now_tick = vi_read_hw_timer();
+			ticks_to_fire = (s32)(next_fire_tick - now_tick);
+
+			if (ticks_to_fire > 0) {
+				u32 us_to_fire = vi_ticks_to_us((u32)ticks_to_fire);
+				ra_sleep_us((s32)us_to_fire);
+				next_fire_tick += frame_ticks;
+			} else if (-ticks_to_fire > (s32)frame_ticks) {
+				/* Missed by more than a full frame — abandon catch-up,
+				 * re-anchor cadence to "now". Otherwise we'd burn through
+				 * a backlog of immediate fires with no sleep. */
+				next_fire_tick = now_tick + frame_ticks;
+			} else {
+				/* Within a frame's overrun — just advance and fire
+				 * immediately. Next frame should re-converge. */
+				next_fire_tick += frame_ticks;
+			}
+
+			/* No periodic vi_dump_state in TIMER_PACING mode — we
+			 * don't call vi_vblank_edge, so the counters stay at 0
+			 * and the dump is uninformative noise. vi_probe_addrs()
+			 * at the top of this block is the one-shot diagnostic
+			 * for VI address discovery. */
+		}
+	}
+#elif defined(USE_VBLANK_SYNC)
+	{
+		#define FALLBACK_FACTOR             2u   /* force fire after N frame-times */
+		#define VI_POLL_MS                  1u
+		#define VI_DIAG_FIRES_PER_DUMP    60u
+
+		u32 last_frame_tick = vi_read_hw_timer();
+		u32 fires_since_dump = 0;
+
+		while (1) {
+			s32 i;
+			u32 now_tick, diff_us;
+			s32 fire_now;
+
+			now_tick = vi_read_hw_timer();
+			diff_us  = vi_ticks_to_us(now_tick - last_frame_tick);
+
+			fire_now = vi_vblank_edge();
+			if (!fire_now && diff_us > (FRAME_US * FALLBACK_FACTOR)) {
+				fire_now = 1;
+			}
+
+			if (!fire_now) {
+				ra_sleep(VI_POLL_MS);
+				continue;
+			}
+
+			last_frame_tick = now_tick;
+
+			(void)ra_send_snapshot();
+			for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
+				(void)ra_send_addr_response();
+			}
+
+			if (VI_DIAG_FIRES_PER_DUMP > 0) {
+				fires_since_dump++;
+				if (fires_since_dump >= VI_DIAG_FIRES_PER_DUMP) {
+					fires_since_dump = 0;
+					vi_dump_state();
+				}
+			}
+		}
+	}
+#else
+	/* Fixed-cadence fallback. ~41Hz effective. */
 	while (1) {
 		s32 i;
-
 		(void)ra_send_snapshot();
-
-		/* Multi-pass: keep responding to ADDR_QUERY events until the
-		 * ESP32 stops asking (response is ACK / WATCHLIST_APPEND /
-		 * WATCHLIST_TRUNCATE / NONE). Cap at 12 rounds — matches ESP32's
-		 * ADDR_QUERY_MAX_ITERATIONS so we don't deadlock if convergence
-		 * never reaches new_missing=0 due to a bug. */
 		for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
 			(void)ra_send_addr_response();
 		}
-
-		/* 16ms = ~60Hz target cadence (matches typical PPC game vblank rate).
-		 *
-		 * Phase B + SETTLE math at steady state (chain resolved, SNAPSHOT
-		 * → ACK only):
-		 *   ~0.5ms write + ~1ms wait_int + 1ms SETTLE + ~0.5ms read = ~3ms
-		 *   inter-trans overhead, plus ra_parse_response ≈ 0.1ms.
-		 *   16ms sleep + 3ms work = ~19ms → ~52Hz effective.
-		 *
-		 * During multi-pass (chain discovery or post-eviction resync), each
-		 * extra ADDR_RESP round adds another ~3ms, eating into the sleep
-		 * budget. Worst case observed in v0.19.2 boot: 3 multi-pass rounds
-		 * = 12ms of EXI work, leaves 4ms of sleep before next SNAPSHOT.
-		 * Steady-state recovers in ~1-2 frames once chain is fully cached.
-		 *
-		 * History:
-		 *   - v0.17.2: ra_sleep(33) for ~30Hz (Phase A throttled).
-		 *   - v0.19.0-2: ra_sleep(2000) for debug visibility at 0.5Hz.
-		 *   - v0.19.3: ra_sleep(16) for ~60Hz (this version).
-		 *
-		 * If we ever need stricter 60Hz pacing, compute remaining budget
-		 * from the elapsed time since SNAPSHOT start and sleep accordingly.
-		 * For now a fixed 16ms gives consistent ESP-side breathing room. */
 		ra_sleep(16);
 	}
+#endif
 	return 0;
 }
 
