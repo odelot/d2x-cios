@@ -172,6 +172,180 @@ static s32 ra_send(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 	                       tx, tx_len, rx, rx_len);
 }
 
+/* ---------- Debug log channel ----------
+ *
+ * .rodata is not loaded in this module ([[project-ra-module-rodata-not-loaded]])
+ * so we cannot use C string literals as message bodies. Instead we build the
+ * payload byte-by-byte on the stack using char literals (which the compiler
+ * resolves to immediate u8 constants at compile time) and a hex-nibble helper.
+ *
+ * Wire: RA_CMD_DEBUG_LOG + u8 msg_len + ASCII text. Fire-and-forget — no read
+ * phase, no wait_int. Whatever the ESP queues as the implicit ACK sits in
+ * tx_buf until the next real round, which pre-clears EXI_IRQ in ra_send_phase_b
+ * anyway. Keeps the debug path from interfering with the SNAPSHOT timing. */
+
+static u8 ra_dbg_hex(u8 nibble)
+{
+	if (nibble < 10) return (u8)('0' + nibble);
+	return (u8)('A' + (nibble - 10));
+}
+
+static u32 ra_dbg_hex_bytes(u8 *dst, const u8 *src, u32 n, u8 sep)
+{
+	u32 j;
+	u32 o = 0;
+	for (j = 0; j < n; j++) {
+		dst[o++] = ra_dbg_hex(src[j] >> 4);
+		dst[o++] = ra_dbg_hex(src[j] & 0xF);
+		if (sep && j + 1 < n) dst[o++] = sep;
+	}
+	return o;
+}
+
+static u32 ra_dbg_u16_dec(u8 *dst, u16 v)
+{
+	u8 tmp[6];
+	u32 n = 0, o = 0;
+	if (v == 0) { dst[0] = '0'; return 1; }
+	while (v > 0) { tmp[n++] = (u8)('0' + (v % 10)); v /= 10; }
+	while (n > 0) dst[o++] = tmp[--n];
+	return o;
+}
+
+static void ra_debug_send(const u8 *msg, u8 msg_len)
+{
+	/* Largest packet: 4 hdr + 1 len + 255 msg = 260 bytes. */
+	static u8 buf[260] __attribute__((aligned(32)));
+	ra_gc_header_t *hdr = (ra_gc_header_t *)buf;
+	u32 total;
+
+	hdr->magic       = RA_MAGIC_GC_TO_ESP;
+	hdr->command     = RA_CMD_DEBUG_LOG;
+	hdr->payload_len = (u16)(1 + msg_len);
+
+	buf[sizeof(ra_gc_header_t)] = msg_len;
+	if (msg_len > 0) {
+		memcpy(buf + sizeof(ra_gc_header_t) + 1, msg, msg_len);
+	}
+
+	total = sizeof(ra_gc_header_t) + 1 + msg_len;
+
+	/* Guard against ESP still processing the previous Phase B read: give the
+	 * main loop a chance to call exi_spi_arm. 10ms is generous. */
+	ra_sleep(10);
+
+	/* Pre-clear any stale INT latch from earlier rounds (a SNAPSHOT response
+	 * assertion that we already consumed in the prior Phase B read, etc).
+	 * Mirrors ra_send_phase_b's pre-clear discipline. */
+	exi_clear_int(RA_EXI_CHAN);
+
+	if (exi_select(RA_EXI_CHAN, RA_EXI_DEV, RA_EXI_FREQ) < 0) return;
+	(void)exi_imm_write(RA_EXI_CHAN, buf, total);
+	exi_deselect(RA_EXI_CHAN);
+
+	/* CRITICAL SYNC: wait for the ESP's DEBUG_LOG handler to finish. The ESP
+	 * does Serial.print(msg) (~2ms at 250000 baud for a 50-char message),
+	 * preps an ACK via prepare_response, calls exi_spi_arm, and finally
+	 * asserts INT (because g_response_prepared=true). We block here until
+	 * that INT assertion is observed.
+	 *
+	 * Without this wait, ra-module returns IMMEDIATELY after its write
+	 * CS-low and the main loop fires the next Phase B WRITE while the ESP
+	 * is still mid-Serial.print — the slave is NOT armed → bytes are
+	 * dropped → ra-module's subsequent read returns all 0xFF (idle MISO).
+	 * Verified in the v0.19.1 + debug-no-sync log: every debug_send was
+	 * followed by an all-FF response on the next round (lines 117/118 of
+	 * wii.log timestamp 00:20:15).
+	 *
+	 * We don't bother reading the ACK; we just need to know the ESP is
+	 * armed and ready. 100ms timeout is the same budget as Phase B itself. */
+	(void)exi_wait_int(RA_EXI_CHAN, 100);
+	exi_clear_int(RA_EXI_CHAN);
+}
+
+/* Phase B request/response pair, gated by ESP→Wii INT line (slot pin 2 →
+ * GPIO14). Eliminates the arm-after-prepare 1-tx delay that plagued the
+ * single-CS-low ra_send: the ESP has time to parse the request, prepare
+ * the response into tx_buf, and arm BEFORE the Wii opens the read CS-low.
+ *
+ * Sequence:
+ *   1. WRITE phase  — exi_select + imm_write(req) + exi_deselect
+ *   2. WAIT phase   — poll EXI_CSR EXI_IRQ (timeout = 100 ms)
+ *   3. CLEAR phase  — RW1C the latch so the next round starts clean
+ *   4. READ phase   — exi_select + imm_read(resp) + exi_deselect
+ *
+ * Returns 0 on success, negative on EXI error or INT timeout. INT timeout
+ * means the ESP didn't respond — could indicate firmware crash, wiring
+ * issue, or extreme processing latency. Caller can treat it as a missed
+ * round and continue (next SNAPSHOT will try again). */
+static s32 ra_send_phase_b(const void *tx, u32 tx_len, void *rx, u32 rx_len)
+{
+	s32 ret;
+
+	/* Pre-clear any stale EXI_IRQ latch. The ESP firmware sets
+	 * g_response_prepared=true on every prepare_response, which triggers
+	 * an INT assertion after arm — including paths where the Wii doesn't
+	 * actually wait for the INT (e.g. the boot IDENTIFY round-trip on
+	 * legacy ra_send, or any future Phase A residual call site). Without
+	 * this pre-clear, the next ra_send_phase_b's wait_int would observe
+	 * the leftover latch immediately and race ahead of the ESP's
+	 * SNAPSHOT-response arm.
+	 *
+	 * RW1C is cheap and idempotent — clearing an already-clear bit is a
+	 * no-op. No race with concurrent ESP assertion because the ESP only
+	 * asserts INT inside its arm() path, which can only execute after a
+	 * transaction completes — and no transaction is in flight at this
+	 * point in our call. */
+	exi_clear_int(RA_EXI_CHAN);
+
+	/* WRITE phase — one CS-low, write only. */
+	ret = exi_select(RA_EXI_CHAN, RA_EXI_DEV, RA_EXI_FREQ);
+	if (ret < 0) return ret;
+	if (tx && tx_len) {
+		ret = exi_imm_write(RA_EXI_CHAN, tx, tx_len);
+		if (ret < 0) { exi_deselect(RA_EXI_CHAN); return ret; }
+	}
+	exi_deselect(RA_EXI_CHAN);
+
+	/* WAIT phase — ESP processes + arms + asserts INT.
+	 * 100 ms timeout: a healthy round trip is sub-ms; 100 ms is "the ESP
+	 * is hung, give up". The CSR latch is sticky so we cannot miss the
+	 * signal — only a complete absence of INT assertion can time out. */
+	ret = exi_wait_int(RA_EXI_CHAN, 100);
+	if (ret < 0) return ret;
+
+	/* CLEAR phase — RW1C the EXI_IRQ bit so the next round's wait starts
+	 * from a clean slate. Must happen BEFORE the read CS-low so we don't
+	 * race a second assertion (shouldn't happen given our serial protocol,
+	 * but cheap insurance). */
+	exi_clear_int(RA_EXI_CHAN);
+
+	/* SETTLE phase — ESP asserts INT immediately after spi_slave_queue_trans
+	 * returns, but ESP-IDF's SPI slave driver may not have fully configured
+	 * DMA yet (the driver task wakes from the queue and sets up DMA
+	 * descriptors asynchronously). Without this delay, ra-module opens the
+	 * read CS-low before DMA is armed → slave outputs idle MISO (all 0xFF)
+	 * instead of tx_buf. Empirically reproduces for response_len >= 520
+	 * bytes (ADDR_QUERY for 128 addrs); does NOT reproduce for the 24-byte
+	 * ADDR_QUERY for 4 addrs in frame 1. Likely because the larger memcpy
+	 * inside the SPI driver task takes more time to set up DMA.
+	 *
+	 * 1ms is generous — even worst-case DMA setup is <100μs. ra_sleep
+	 * blocks via the IOS message-queue timer so it's a real sleep, not a
+	 * busy spin. Cost: ~1ms per Phase B round = negligible. */
+	ra_sleep(1);
+
+	/* READ phase — second CS-low, read only. ESP's tx_buf is now armed
+	 * with the freshly prepared response. */
+	ret = exi_select(RA_EXI_CHAN, RA_EXI_DEV, RA_EXI_FREQ);
+	if (ret < 0) return ret;
+	if (rx && rx_len) {
+		ret = exi_imm_read(RA_EXI_CHAN, rx, rx_len);
+	}
+	exi_deselect(RA_EXI_CHAN);
+	return ret;
+}
+
 static void ra_fill_header(ra_gc_header_t *h, u8 cmd, u16 payload_len)
 {
 	h->magic       = RA_MAGIC_GC_TO_ESP;
@@ -419,7 +593,23 @@ static void ra_parse_response(const u8 *buf)
 	ra_esp_header_t resp;
 
 	memcpy(&resp, buf, sizeof(resp));
-	if (resp.magic != RA_MAGIC_ESP_TO_GC) return;
+
+	/* DIAG (anomaly-only): if magic check fails, log the leading byte AND
+	 * the first 16 bytes of the response. Magic-fail means ra-module either
+	 * read default_ack (timing race), all-FF (slave unarmed), or completely
+	 * unexpected garbage — exact bytes pinpoint which. Stays silent on the
+	 * happy path, so it's safe at 60Hz. */
+	if (resp.magic != RA_MAGIC_ESP_TO_GC) {
+		u8 m[80];
+		u32 o = 0;
+		m[o++] = 'b'; m[o++] = 'a'; m[o++] = 'd'; m[o++] = ' ';
+		m[o++] = 'm'; m[o++] = 'a'; m[o++] = 'g'; m[o++] = '=';
+		o += ra_dbg_hex_bytes(m + o, &resp.magic, 1, 0);
+		m[o++] = ' '; m[o++] = 'R'; m[o++] = 'X'; m[o++] = '=';
+		o += ra_dbg_hex_bytes(m + o, buf, 16, ' ');
+		ra_debug_send(m, (u8)o);
+		return;
+	}
 
 	if (resp.event_type == RA_EVT_ADDR_QUERY) {
 		ra_addr_query_t aq;
@@ -434,6 +624,13 @@ static void ra_parse_response(const u8 *buf)
 		}
 	}
 	else if (resp.event_type == RA_EVT_WATCHLIST_APPEND) {
+		/* No dedup here — ESP32 (v0.17.1+) has mismatch_last_sent_count
+		 * dup-suppression so duplicates never reach us. Adding a dedup
+		 * here caused sync drift with REMOVE: rejected entries left
+		 * ra_watchlist_count behind ESP32's view, then REMOVE for the
+		 * "tail" couldn't find some addresses, ra-module ended at a
+		 * different count than expected, canonical padding desynced,
+		 * multi-pass died (observed v0.18 2026-06-01). Trust ESP32. */
 		ra_watchlist_append_t wa;
 		memcpy(&wa, buf + sizeof(resp), sizeof(wa));
 		if (wa.addr_count > 0
@@ -446,27 +643,88 @@ static void ra_parse_response(const u8 *buf)
 				ra_watchlist[ra_watchlist_count + j] = addr;
 			}
 			ra_watchlist_count += wa.addr_count;
+		} else {
+			/* DIAG (anomaly-only): APPEND rejected. Either zero-count
+			 * (protocol violation) or would overflow RA_MAX_WATCH_ADDRS
+			 * (ESP-side capacity bug — ESP shouldn't APPEND past 1024).
+			 * Log the raw wa.addr_count bytes and current state. */
+			u8 m[64];
+			u32 o = 0;
+			m[o++] = 'A'; m[o++] = 'P'; m[o++] = 'P'; m[o++] = 'X';
+			m[o++] = ' '; m[o++] = 'n'; m[o++] = '=';
+			o += ra_dbg_u16_dec(m + o, wa.addr_count);
+			m[o++] = ' '; m[o++] = 'w'; m[o++] = 'c'; m[o++] = '=';
+			o += ra_dbg_u16_dec(m + o, ra_watchlist_count);
+			m[o++] = ' '; m[o++] = 'r'; m[o++] = 'a'; m[o++] = 'w'; m[o++] = '=';
+			o += ra_dbg_hex_bytes(m + o, buf + sizeof(resp), 2, 0);
+			ra_debug_send(m, (u8)o);
 		}
 	}
 	else if (resp.event_type == RA_EVT_WATCHLIST_TRUNCATE) {
-		/* Phase A: ESP32 evicted dynamic addresses LRU-style and asks us
-		 * to drop the tail of ra_watchlist[]. Insertion order matches
-		 * ESP32 (we appended in the same order), so shrinking by index
-		 * is correct. ESP32 guarantees keep_count >= initial_static_count.
-		 * No additional address list follows the header. */
+		/* Deprecated event (Phase A v0.17.0) — kept parsed for backward
+		 * compat. Phase A.5 uses RA_EVT_WATCHLIST_REMOVE instead. */
 		ra_watchlist_truncate_t wt;
 		memcpy(&wt, buf + sizeof(resp), sizeof(wt));
 		if (wt.keep_count <= ra_watchlist_count) {
 			ra_watchlist_count = wt.keep_count;
 		}
 	}
+	else if (resp.event_type == RA_EVT_WATCHLIST_REMOVE) {
+		/* Phase A.5: ESP32 evicted N specific addresses (LRU). For each,
+		 * find it in ra_watchlist[] (linear search) and shift the survivors
+		 * down. Insertion order of survivors preserved → matches ESP32's
+		 * post-defrag layout, so SNAPSHOT positions stay aligned.
+		 *
+		 * Implementation: build a "to_remove" bitmap (small, 1024 bits),
+		 * then single-pass compact. O(N + R*N) where N=watch_count,
+		 * R=remove_count. Fine for N≤1024, R≤256. */
+		ra_watchlist_remove_t wr;
+		memcpy(&wr, buf + sizeof(resp), sizeof(wr));
+		if (wr.addr_count > 0
+		    && wr.addr_count <= ra_watchlist_count) {
+			const u8 *src = buf
+			              + sizeof(resp) + sizeof(wr);
+			u16 r, i;
+			static u8 to_remove[RA_MAX_WATCH_ADDRS];  /* one byte per entry */
+			memset(to_remove, 0, ra_watchlist_count);
+			for (r = 0; r < wr.addr_count; r++) {
+				u32 addr;
+				memcpy(&addr, src + r * 4, 4);
+				for (i = 0; i < ra_watchlist_count; i++) {
+					if (ra_watchlist[i] == addr && !to_remove[i]) {
+						to_remove[i] = 1;
+						break;
+					}
+				}
+			}
+			/* Compact: shift survivors down. */
+			u16 write_idx = 0;
+			for (i = 0; i < ra_watchlist_count; i++) {
+				if (!to_remove[i]) {
+					if (write_idx != i) {
+						ra_watchlist[write_idx] = ra_watchlist[i];
+					}
+					write_idx++;
+				}
+			}
+			ra_watchlist_count = write_idx;
+		}
+	}
 }
 
 /* Send SNAPSHOT — read all watchlist values from PPC RAM and ship them.
- * Updates ra_canonical_tx_len so subsequent ADDR_RESPONSE writes pad
- * to match the SNAPSHOT width (the protocol's "canonical padding"
- * invariant). The response (if any) lands in ra_snap_rx_buf and is
- * parsed by ra_parse_response. */
+ *
+ * Phase B (INT-handshake) smoke test: this path uses ra_send_phase_b which
+ * splits write and read into two CS-low pulses gated by the ESP's INT
+ * assertion. The 1-tx arm-after-prepare delay is gone, so the ESP's
+ * response can be variable-length (no canonical padding needed) — we just
+ * read enough to cover the header, then the declared payload.
+ *
+ * ra_canonical_tx_len is no longer used for SNAPSHOT but is kept updated
+ * so ra_send_addr_response (still on legacy single-CS-low Phase A path)
+ * continues to pad correctly. Once the Phase B smoke test confirms the
+ * SNAPSHOT path, ra_send_addr_response will be converted next and the
+ * canonical-padding bookkeeping deleted entirely. */
 static s32 ra_send_snapshot(void)
 {
 	ra_gc_header_t        *hdr;
@@ -493,12 +751,12 @@ static s32 ra_send_snapshot(void)
 	}
 
 	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count;
-	ra_canonical_tx_len = tx_len;
+	ra_canonical_tx_len = tx_len;  /* still consumed by ra_send_addr_response */
 
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
-	ret = ra_send(ra_snap_tx_buf, tx_len, ra_snap_rx_buf, rx_len);
+	ret = ra_send_phase_b(ra_snap_tx_buf, tx_len, ra_snap_rx_buf, rx_len);
 	if (ret < 0) return ret;
 
 	ra_parse_response(ra_snap_rx_buf);
@@ -506,9 +764,21 @@ static s32 ra_send_snapshot(void)
 }
 
 /* Send ADDR_RESPONSE for the currently pending query — read each addr
- * from PPC RAM, build the response, pad to canonical width, ship. The
- * response from ESP32 may carry the next ADDR_QUERY round (multi-pass
- * convergence) or WATCHLIST_APPEND/TRUNCATE — handled by ra_parse_response. */
+ * from PPC RAM, build the response, ship. The response from ESP32 may
+ * carry the next ADDR_QUERY round (multi-pass convergence) or
+ * WATCHLIST_APPEND/REMOVE — handled by ra_parse_response.
+ *
+ * Phase B: uses ra_send_phase_b (INT-handshake) so there's no more
+ * arm-after-prepare 1-tx delay. Canonical padding is no longer required
+ * for correctness here either, but we still pad to ra_canonical_tx_len
+ * because the ESP firmware's old send_padded_response path may still be
+ * length-sensitive in transient code paths during Phase B rollout. Once
+ * the ESP firmware drops canonical padding, this memset goes away.
+ *
+ * Pre-burst sleep is gone — the race it patched (ESP's "no descriptor
+ * queued" window between two back-to-back writes) is impossible under
+ * Phase B because the WAIT phase blocks until the ESP has explicitly
+ * armed and asserted INT. No descriptor-not-ready window exists. */
 static s32 ra_send_addr_response(void)
 {
 	ra_gc_header_t      *hdr;
@@ -536,11 +806,6 @@ static s32 ra_send_addr_response(void)
 	}
 
 	actual_len = sizeof(ra_gc_header_t) + sizeof(ra_addr_response_t) + count;
-
-	/* Canonical padding — pad ADDR_RESPONSE to SNAPSHOT width so ESP32's
-	 * `last_snap_req_len` based response prep aligns with our RX. If
-	 * SNAPSHOT happened to be shorter (impossible in steady state since
-	 * SNAPSHOT carries watchlist values, but defensive), use actual. */
 	tx_len = (actual_len > ra_canonical_tx_len) ? actual_len
 	                                            : ra_canonical_tx_len;
 	if (tx_len > actual_len) {
@@ -550,12 +815,7 @@ static s32 ra_send_addr_response(void)
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
-	/* Pre-burst sleep — give ESP32 a beat to arm its response descriptor.
-	 * Without this the first multi-pass ADDR_RESPONSE races and gets
-	 * dropped (the ESP32 only arms post-CS-rise of the previous tx). */
-	ra_sleep(1);
-
-	ret = ra_send(ra_snap_tx_buf, tx_len, ra_snap_rx_buf, rx_len);
+	ret = ra_send_phase_b(ra_snap_tx_buf, tx_len, ra_snap_rx_buf, rx_len);
 	if (ret < 0) return ret;
 
 	ra_pending_query_count = 0;  /* consumed */
@@ -680,9 +940,28 @@ static u32 ra_poll_thread(void *arg)
 			(void)ra_send_addr_response();
 		}
 
-		/* 16ms = ~60Hz cadence. ra_sleep is a blocking syscall-based
-		 * timer (NOT busy-wait — busy-wait at this loop level locked
-		 * up IOS_ReloadIOS in earlier iterations). */
+		/* 16ms = ~60Hz target cadence (matches typical PPC game vblank rate).
+		 *
+		 * Phase B + SETTLE math at steady state (chain resolved, SNAPSHOT
+		 * → ACK only):
+		 *   ~0.5ms write + ~1ms wait_int + 1ms SETTLE + ~0.5ms read = ~3ms
+		 *   inter-trans overhead, plus ra_parse_response ≈ 0.1ms.
+		 *   16ms sleep + 3ms work = ~19ms → ~52Hz effective.
+		 *
+		 * During multi-pass (chain discovery or post-eviction resync), each
+		 * extra ADDR_RESP round adds another ~3ms, eating into the sleep
+		 * budget. Worst case observed in v0.19.2 boot: 3 multi-pass rounds
+		 * = 12ms of EXI work, leaves 4ms of sleep before next SNAPSHOT.
+		 * Steady-state recovers in ~1-2 frames once chain is fully cached.
+		 *
+		 * History:
+		 *   - v0.17.2: ra_sleep(33) for ~30Hz (Phase A throttled).
+		 *   - v0.19.0-2: ra_sleep(2000) for debug visibility at 0.5Hz.
+		 *   - v0.19.3: ra_sleep(16) for ~60Hz (this version).
+		 *
+		 * If we ever need stricter 60Hz pacing, compute remaining budget
+		 * from the elapsed time since SNAPSHOT start and sleep accordingly.
+		 * For now a fixed 16ms gives consistent ESP-side breathing room. */
 		ra_sleep(16);
 	}
 	return 0;
