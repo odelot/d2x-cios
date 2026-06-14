@@ -27,6 +27,7 @@ make_modules() {
         do_make ffs-plugin   ${D2XBUILD}/FFSP  ${CLEAN}
         do_make mload-module ${D2XBUILD}/MLOAD ${CLEAN}
         do_make usb-module   ${D2XBUILD}/USBS  ${CLEAN}
+        do_make ra-module    ${D2XBUILD}/RAMOD ${CLEAN}
 
         [ "${CLEAN}" == "clean" ] && completed
 

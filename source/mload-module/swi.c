@@ -115,6 +115,42 @@ s32 Swi_Handler(u32 arg0, u32 arg1, u32 arg2, u32 arg3)
 		*(vu32 *)arg1 &= ~arg2;
 		break;
 
+	/** Atomic EXI DATA + CR write (immediate-mode trigger)
+	 *  arg1 = EXI channel (0, 1, or 2)
+	 *  arg2 = DATA register value (up to 4 bytes packed big-endian)
+	 *  arg3 = CR register value (must include TSTART; encodes TLEN, RW)
+	 *  Runs in SVC mode with IRQs masked, so DATA and CR writes are
+	 *  back-to-back atomic — no context switch / IRQ handler can slip in
+	 *  between and disturb the EXI bus state. Caller polls CR bit 0 for
+	 *  completion via cmd 3 (read register). */
+	case 7: {
+		u32 base = 0xd806800 + (arg1 & 3) * 0x14;
+		*(vu32 *)(base + 0x10) = arg2;  /* EXIx_DATA */
+		*(vu32 *)(base + 0x0c) = arg3;  /* EXIx_CR  (TSTART) */
+		break;
+	}
+
+	/** Atomic EXI CR-trigger + poll-completion + DATA-read (immediate
+	 *  read). The whole CR-trigger / poll / DATA-read sequence runs in
+	 *  SVC mode (IRQs masked), so nothing slips in between the moments
+	 *  the EXI transfer completes and we sample the DATA register.
+	 *  arg1 = EXI channel (0..2)
+	 *  arg2 = CR register value (TSTART set, RW=read, TLEN encoded)
+	 *  Returns the 4-byte DATA register contents (big-endian packed).
+	 *  Poll is bounded (~100k iterations ≈ a few ms worst case) so a
+	 *  hung EXI bus does NOT freeze the kernel; on timeout DATA is
+	 *  read anyway and the caller will see garbage values that will
+	 *  fail subsequent protocol parsing (acceptable failure mode). */
+	case 8: {
+		u32 base = 0xd806800 + (arg1 & 3) * 0x14;
+		u32 cr_addr   = base + 0x0c;
+		u32 data_addr = base + 0x10;
+		u32 timeout = 100000;
+		*(vu32 *)cr_addr = arg2;            /* trigger */
+		while ((*(vu32 *)cr_addr & 1) && --timeout) { /* busy-wait */ }
+		return (s32)(*(vu32 *)data_addr);   /* sample DATA */
+	}
+
 	/** Memcpy (uncached to cached) **/
 	case 9:
 		__MemCopy(1, (void *)arg1, (void *)arg2, arg3);
