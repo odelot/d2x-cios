@@ -156,6 +156,69 @@ s32 Swi_Handler(u32 arg0, u32 arg1, u32 arg2, u32 arg3)
 		__MemCopy(1, (void *)arg1, (void *)arg2, arg3);
 		break;
 
+	/** EXI immediate-mode BATCH write — whole buffer in one SVC.
+	 *  arg1 = EXI channel (0..2)
+	 *  arg2 = source buffer
+	 *  arg3 = byte count
+	 *  Loops 4-byte chunks: pack big-endian, DATA write, CR trigger
+	 *  (TSTART | RW=write | TLEN), bounded poll for completion. The whole
+	 *  batch runs with IRQs masked (SVC), so callers must slice large
+	 *  buffers into <=256-byte calls (~260us at 8MHz) to bound IRQ
+	 *  latency. Replaces ~5 user-mode SVC round-trips per chunk.
+	 *  Why not EXI DMA: field test 2026-06-12 showed the EXI DMA engine
+	 *  clocking zeros and stalling when MAR pointed at MEM2 module
+	 *  memory — the legacy engine can't master that path from Starlet.
+	 *  Returns 0 on success, -1 if a chunk timed out. */
+	case 10: {
+		u32 base = 0xd806800 + (arg1 & 3) * 0x14;
+		u32 cr_addr   = base + 0x0c;
+		u32 data_addr = base + 0x10;
+		const u8 *src = (const u8 *)arg2;
+		u32 left = arg3;
+		while (left > 0) {
+			u32 n = (left >= 4) ? 4 : left;
+			u32 val = 0, i;
+			u32 timeout = 100000;
+			for (i = 0; i < n; i++)
+				val |= ((u32)src[i]) << ((3 - i) * 8);
+			*(vu32 *)data_addr = val;
+			*(vu32 *)cr_addr   = 1u | (1u << 2) | ((n - 1) << 4);
+			while ((*(vu32 *)cr_addr & 1) && --timeout) { /* busy-wait */ }
+			if (!timeout)
+				return -1;
+			src  += n;
+			left -= n;
+		}
+		return 0;
+	}
+
+	/** EXI immediate-mode BATCH read — mirror of case 10.
+	 *  arg1 = EXI channel, arg2 = destination buffer, arg3 = byte count.
+	 *  Per chunk: CR trigger (TSTART | RW=read | TLEN), bounded poll,
+	 *  sample DATA, unpack big-endian. Returns 0, or -1 on timeout. */
+	case 11: {
+		u32 base = 0xd806800 + (arg1 & 3) * 0x14;
+		u32 cr_addr   = base + 0x0c;
+		u32 data_addr = base + 0x10;
+		u8 *dst = (u8 *)arg2;
+		u32 left = arg3;
+		while (left > 0) {
+			u32 n = (left >= 4) ? 4 : left;
+			u32 val, i;
+			u32 timeout = 100000;
+			*(vu32 *)cr_addr = 1u | ((n - 1) << 4);
+			while ((*(vu32 *)cr_addr & 1) && --timeout) { /* busy-wait */ }
+			if (!timeout)
+				return -1;
+			val = *(vu32 *)data_addr;
+			for (i = 0; i < n; i++)
+				dst[i] = (val >> ((3 - i) * 8)) & 0xFF;
+			dst  += n;
+			left -= n;
+		}
+		return 0;
+	}
+
 	/** Call function **/
 	case 16: {
 		s32 (*Function)(void *in, void *out);

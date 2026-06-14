@@ -32,11 +32,14 @@ s32  exi_deselect(s32 chan);
 s32  exi_imm_write(s32 chan, const void *data, u32 len);
 s32  exi_imm_read(s32 chan, void *data, u32 len);
 
-/* DMA write — Hollywood reads `len` bytes from `data` directly via the
- * EXI DMA controller. Requirements: `data` 32-byte aligned, `len` is a
- * multiple of 32, cache will be flushed internally. Single CR write
- * instead of len/4 separate writes, so no multi-CR write corruption. */
-s32  exi_dma_write(s32 chan, const void *data, u32 len);
+/* Kernel-batched immediate transfers — same wire behavior as the
+ * exi_imm_* loops but the per-chunk work runs inside MLOAD's SVC
+ * handler, one syscall per 256-byte slice. No alignment constraints.
+ * PREFER THESE over the plain exi_imm_* loops for anything bigger than
+ * a header. (EXI DMA was tried and removed: the engine cannot master
+ * MEM2 module memory from Starlet — see exi.c for the field lessons.) */
+s32  exi_batch_write(s32 chan, const void *data, u32 len);
+s32  exi_batch_read(s32 chan, void *data, u32 len);
 
 /* Convenience: full half-duplex transaction.
  * Writes wlen bytes from wbuf, then reads rlen bytes into rbuf.
@@ -45,10 +48,6 @@ s32  exi_transaction(s32 chan, s32 dev, s32 freq,
                      const void *wbuf, u32 wlen,
                      void *rbuf, u32 rlen);
 
-/* DMA-write variant: select → DMA write → deselect. No read phase.
- * For SNAPSHOT-style commands where we don't need the response. */
-s32  exi_dma_transaction(s32 chan, s32 dev, s32 freq,
-                         const void *data, u32 len);
 
 /* --- Phase B: device-INT handshake (slot pin 2 → ESP32 GPIO14) ---
  *

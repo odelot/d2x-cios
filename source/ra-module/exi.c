@@ -20,6 +20,7 @@
  * gave control to threads that didn't yield back. A real timed block lets
  * the scheduler do the right thing. */
 extern void ra_sleep(s32 time_ms);
+extern void ra_sleep_us(s32 time_us);
 
 /* ----- Hardware register addresses (Starlet virtual via MMU) -----
  * Match cios-lib/hollywood.h. EXI_REG_BASE = 0xd806800.
@@ -146,10 +147,14 @@ static s32 wait_cr_done(s32 chan) {
 		if (++spins >= SPINS_BEFORE_YIELD) {
 			spins = 0;
 			if (++yields >= MAX_YIELDS) return -2;
-			/* 1ms blocking sleep — see extern comment above for why we
-			 * don't use os_thread_yield. With MAX_YIELDS=200, worst case
-			 * timeout is ~200ms + queue/timer overhead. */
-			ra_sleep(1);
+			/* 250us blocking sleep — see extern comment above for why we
+			 * don't use os_thread_yield. Granularity matters for the DMA
+			 * paths: a 1KB DMA burst at 8MHz takes ~1ms, so the first
+			 * sleep usually completes it; 1ms steps overshot by ~0.5ms
+			 * per transfer. Immediate (4-byte) transfers finish inside
+			 * the spin budget and never reach the sleep. Worst-case
+			 * timeout: 200 yields x 250us = ~50ms. */
+			ra_sleep_us(250);
 		}
 	}
 	return 0;
@@ -188,39 +193,53 @@ s32 exi_imm_write(s32 chan, const void *data, u32 len) {
 	return 0;
 }
 
-/* ---------- DMA write — single CR transfer for large buffers ----------
- *
- * EXI DMA mode bypasses the per-4-byte immediate loop entirely. The
- * Hollywood EXI controller reads `len` bytes from `data` (physical addr)
- * and shifts them out on DO during one CS-low window.
- *
- * Requirements:
- *   - `data` aligned to 32 bytes
- *   - `len` multiple of 32 bytes
- *   - cache flushed before triggering DMA so Hollywood sees latest data
- *
- * Returns 0 on success, negative on parameter / timeout error.
- *
- * CR bits for DMA write: TSTART(0) + DMA(1) + RW=01 (write) = 0x07.
- * DCFlushRange comes from cios-lib/tools.h (already included). */
+/* (v0.27.0: exi_dma_write / exi_dma_read were removed. Two field lessons
+ * survive them, documented here because both WILL bite again if DMA is
+ * ever retried: (1) cios-lib's DCFlushRange is a raw `mcr p15` cache op —
+ * UNDEF in USER mode, kills the thread; use the os_sync_* syscalls.
+ * (2) The legacy EXI DMA engine cannot master MEM2 module memory from
+ * Starlet — it clocks zeros and stalls mid-transfer (2026-06-12). The
+ * kernel-batched immediate path below is the proven replacement.) */
 
-s32 exi_dma_write(s32 chan, const void *data, u32 len) {
-	if (chan < 0 || chan > 2)        return -1;
-	if (((u32)data & 0x1Fu) != 0)    return -3;  /* address not 32B aligned */
-	if ((len & 0x1Fu) != 0)          return -4;  /* length not 32B aligned */
-	if (len == 0)                    return 0;
+/* ---------- Kernel-batched immediate transfers ----------
+ *
+ * Same wire behavior as exi_imm_write/exi_imm_read (4-byte immediate
+ * chunks, CS held by the caller), but the chunk loop runs inside MLOAD's
+ * SVC handler: ONE syscall per 256-byte slice instead of ~5 per chunk
+ * (1 trigger + CR-poll reads). A 790-byte snapshot write drops from
+ * ~1000 SVC round-trips (~3-4ms) to 4 (~1.1ms, mostly wire time).
+ *
+ * 256-byte slices bound the IRQs-masked window inside the kernel to
+ * ~260us at 8MHz. No alignment or length constraints.
+ *
+ * Why not EXI DMA (exi_dma_*): field test 2026-06-12 — the engine
+ * clocked zeros and stalled mid-transfer with MAR pointing at MEM2
+ * module memory. The legacy EXI DMA engine can't master that path from
+ * Starlet. Keep using the immediate interface, just batched. */
+#define EXI_BATCH_SLICE 256u
 
-	/* Flush our virtual buffer so Hollywood sees the latest bytes. */
-	DCFlushRange((void *)data, (int)len);
+s32 exi_batch_write(s32 chan, const void *data, u32 len) {
+	const u8 *p = (const u8 *)data;
+	if (chan < 0 || chan > 2) return -1;
+	while (len > 0) {
+		u32 n = (len >= EXI_BATCH_SLICE) ? EXI_BATCH_SLICE : len;
+		if (Swi_ExiBatchWrite(chan, p, n) != 0) return -2;
+		p   += n;
+		len -= n;
+	}
+	return 0;
+}
 
-	/* MAR takes a physical address. Starlet's virtual MEM2 range
-	 * (0x13?????? for IOS modules) has bit 31 clear already, so no
-	 * conversion is needed in practice — but mask anyway to be safe. */
-	w32(EXI_MAR(chan),    (u32)data & 0x7FFFFFFFu);
-	w32(EXI_LENGTH(chan), len);
-	w32(EXI_CR(chan),     1u | (1u << 1) | (1u << 2));  /* TSTART | DMA | RW=write */
-
-	return wait_cr_done(chan);
+s32 exi_batch_read(s32 chan, void *data, u32 len) {
+	u8 *p = (u8 *)data;
+	if (chan < 0 || chan > 2) return -1;
+	while (len > 0) {
+		u32 n = (len >= EXI_BATCH_SLICE) ? EXI_BATCH_SLICE : len;
+		if (Swi_ExiBatchRead(chan, p, n) != 0) return -2;
+		p   += n;
+		len -= n;
+	}
+	return 0;
 }
 
 s32 exi_imm_read(s32 chan, void *data, u32 len) {
@@ -241,15 +260,6 @@ s32 exi_imm_read(s32 chan, void *data, u32 len) {
 		buf += n;
 	}
 	return 0;
-}
-
-s32 exi_dma_transaction(s32 chan, s32 dev, s32 freq,
-                        const void *data, u32 len) {
-	s32 ret = exi_select(chan, dev, freq);
-	if (ret < 0) return ret;
-	ret = exi_dma_write(chan, data, len);
-	exi_deselect(chan);
-	return ret;
 }
 
 s32 exi_transaction(s32 chan, s32 dev, s32 freq,
