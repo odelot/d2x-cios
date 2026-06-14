@@ -20,26 +20,37 @@
 #include "led.h"
 #include "gc_ra_protocol.h"
 
-/* Feature toggle. Three modes selectable at build time:
+/* Scheduling: PPC VBI sync (the only mode since v0.27.0 — the HW_TIMER
+ * pacer and the fixed-16ms builds were retired after the VBI lock was
+ * validated on hw 2026-06-12).
  *
- *   USE_TIMER_PACING (default, v0.20.3+):
- *     Hollywood HW_TIMER drives the cadence. Read tick at frame start,
- *     do SNAPSHOT + multi-pass, sleep the residual (FRAME_US - elapsed).
- *     Self-correcting: a slow frame doesn't drift the next one.
- *     Independent of VI register (which v0.20.2 confirmed returns 0
- *     constantly on this Starlet MMU map — see [[project-vi-register-
- *     unmapped]] when written).
+ * True VBLANK alignment: WiiFlow injects a Gecko C0 cheat code that the
+ * Ocarina codehandler executes on every vertical retrace (the VBI
+ * hooktype patches the game's __VIRetraceHandler). The C0 code
+ * increments a u32 frame counter at physical 0x2FF8 via the PPC's
+ * UNCACHED MEM1 mirror. We poll that counter (plain MEM1 read with
+ * os_sync_before_read — Starlet maps PPC RAM cached and a tight poll
+ * pins the line) and fire a SNAPSHOT on change; if the counter never
+ * moves (hook failed to install, loading screen, WiiFlow without RA
+ * support) a 2-frame timer fallback fires on time instead — the
+ * nes-ra-adapter hybrid pattern. See [[project-ppc-vbi-hook-design]].
+ * The counter also serves as: the game-boot callback (ra_poll_thread
+ * waits for it to move before starting), and the true game-frame clock
+ * shipped to the ESP for rcheevos timer accuracy (v0.26.1).
  *
- *   USE_VBLANK_SYNC (v0.20.1, currently broken):
- *     Polls VI's vpos register via wrap-detection. Doesn't actually
- *     work on Starlet (vpos always reads 0), so falls through to the
- *     2-frame timeout giving ~30Hz cadence. Kept for now so we can
- *     iterate on VI address discovery via vi_probe_addrs without
- *     touching this path.
- *
- *   (neither defined):
- *     Fixed ra_sleep(16) cadence ≈ 41Hz effective. Pre-Phase-B fallback. */
-#define USE_TIMER_PACING
+ * Why not ARM-side VI detection: the VI IRQ routes only to Broadway's
+ * Processor Interface; Hollywood's ARM IRQ controller has no VI line
+ * and the Starlet MMU doesn't map VI registers (v0.20.2 read zeros;
+ * v0.20.4 probing crashed the kernel — [[project-vi-probe-crashed-
+ * kernel]]). */
+
+/* Physical MEM1 address of the PPC-side VBI frame counter. Must match the
+ * C0 cheat code WiiFlow injects (ocarina_load_code in WiiFlow's
+ * source/loader/fst.c writes 0xC0002FF8 = uncached mirror of this). The
+ * address sits in the last 8 bytes of the Ocarina codelist region
+ * (0x22A8/0x28B8..0x3000); WiiFlow caps GCT size so cheat codes can never
+ * grow into it, and the booter zeroes it at boot via the codelist memset. */
+#define RA_VBI_COUNTER_PHYS  0x00002FF8u
 
 char *moduleName = "RA_MOD";
 
@@ -211,8 +222,6 @@ static s32 ra_send(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 void ra_sleep(s32 time_ms);
 void ra_sleep_us(s32 time_us);
 
-/* Note: helpers below are intentionally non-static — vi.c uses
- * ra_debug_send / ra_dbg_u16_dec / ra_dbg_hex_bytes for vi_dump_state. */
 u8 ra_dbg_hex(u8 nibble)
 {
 	if (nibble < 10) return (u8)('0' + nibble);
@@ -307,7 +316,14 @@ void ra_debug_send(const u8 *msg, u8 msg_len)
  * means the ESP didn't respond — could indicate firmware crash, wiring
  * issue, or extreme processing latency. Caller can treat it as a missed
  * round and continue (next SNAPSHOT will try again). */
-static s32 ra_send_phase_b(const void *tx, u32 tx_len, void *rx, u32 rx_len)
+/* v0.28.9 — Phase-B timing breakdown (ms). Sampled on the snapshot path,
+ * shipped in the 5s VBI diag, to find where the ~134ms ESP-side cycle goes:
+ * wait (INT latency) vs mem1 (reading the watchlist) vs the rest. */
+volatile u32 g_t_wait_ms = 0;
+volatile u32 g_t_mem1_ms = 0;
+volatile u32 g_t_snap_ms = 0;
+
+static s32 ra_send_phase_b(void *tx, u32 tx_len, void *rx, u32 rx_len)
 {
 	s32 ret;
 
@@ -327,11 +343,18 @@ static s32 ra_send_phase_b(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 	 * point in our call. */
 	exi_clear_int(RA_EXI_CHAN);
 
-	/* WRITE phase — one CS-low, write only. */
+	/* WRITE phase — one CS-low, write only.
+	 *
+	 * Kernel-batched immediate transfer: same wire behavior as the old
+	 * exi_imm_write loop, but the chunk loop runs inside MLOAD's SVC
+	 * handler — 1 syscall per 256-byte slice instead of ~5 per 4-byte
+	 * chunk. 790-byte snapshot: ~3-4ms → ~1.1ms. (EXI DMA was tried
+	 * first and field-failed: the engine can't master MEM2 module
+	 * memory from Starlet — clocked zeros and stalled. See exi.c.) */
 	ret = exi_select(RA_EXI_CHAN, RA_EXI_DEV, RA_EXI_FREQ);
 	if (ret < 0) return ret;
 	if (tx && tx_len) {
-		ret = exi_imm_write(RA_EXI_CHAN, tx, tx_len);
+		ret = exi_batch_write(RA_EXI_CHAN, tx, tx_len);
 		if (ret < 0) { exi_deselect(RA_EXI_CHAN); return ret; }
 	}
 	exi_deselect(RA_EXI_CHAN);
@@ -340,7 +363,12 @@ static s32 ra_send_phase_b(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 	 * 100 ms timeout: a healthy round trip is sub-ms; 100 ms is "the ESP
 	 * is hung, give up". The CSR latch is sticky so we cannot miss the
 	 * signal — only a complete absence of INT assertion can time out. */
-	ret = exi_wait_int(RA_EXI_CHAN, 100);
+	{   /* v0.28.9 — time the wait: if this is ~100ms the INT is arriving
+	     * late (or timing out), which would explain the ~107ms cycle gap. */
+		u32 _wt0 = vi_read_hw_timer();
+		ret = exi_wait_int(RA_EXI_CHAN, 100);
+		g_t_wait_ms = vi_ticks_to_us(vi_read_hw_timer() - _wt0) / 1000u;
+	}
 	if (ret < 0) return ret;
 
 	/* CLEAR phase — RW1C the EXI_IRQ bit so the next round's wait starts
@@ -349,27 +377,23 @@ static s32 ra_send_phase_b(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 	 * but cheap insurance). */
 	exi_clear_int(RA_EXI_CHAN);
 
-	/* SETTLE phase — ESP asserts INT immediately after spi_slave_queue_trans
-	 * returns, but ESP-IDF's SPI slave driver may not have fully configured
-	 * DMA yet (the driver task wakes from the queue and sets up DMA
-	 * descriptors asynchronously). Without this delay, ra-module opens the
-	 * read CS-low before DMA is armed → slave outputs idle MISO (all 0xFF)
-	 * instead of tx_buf. Empirically reproduces for response_len >= 520
-	 * bytes (ADDR_QUERY for 128 addrs); does NOT reproduce for the 24-byte
-	 * ADDR_QUERY for 4 addrs in frame 1. Likely because the larger memcpy
-	 * inside the SPI driver task takes more time to set up DMA.
-	 *
-	 * 1ms is generous — even worst-case DMA setup is <100μs. ra_sleep
-	 * blocks via the IOS message-queue timer so it's a real sleep, not a
-	 * busy spin. Cost: ~1ms per Phase B round = negligible. */
-	ra_sleep(1);
+	/* No SETTLE phase since v0.23.0. The ESP now asserts INT from the
+	 * SPI driver's post_setup callback — i.e. only after the peripheral
+	 * registers/DMA descriptors are genuinely loaded — so a latched INT
+	 * means the read CS-low can start immediately. (Pre-v0.23.0 the
+	 * assert happened right after spi_slave_queue_trans returned, before
+	 * the driver task armed the DMA; responses >= 520 bytes clocked out
+	 * idle 0xFF and a 1ms ra_sleep here papered over the race. Pairing
+	 * rule: this d2x build REQUIRES ESP fw v0.23.0+.) */
 
-	/* READ phase — second CS-low, read only. ESP's tx_buf is now armed
-	 * with the freshly prepared response. */
+	/* READ phase — second CS-low, read only. Kernel-batched for the same
+	 * reason as the write phase: the 1024-byte response read was ~256
+	 * SVC chunk round-trips (~3-5ms); batched it's 4 syscalls (~1.1ms,
+	 * mostly wire time). */
 	ret = exi_select(RA_EXI_CHAN, RA_EXI_DEV, RA_EXI_FREQ);
 	if (ret < 0) return ret;
 	if (rx && rx_len) {
-		ret = exi_imm_read(RA_EXI_CHAN, rx, rx_len);
+		ret = exi_batch_read(RA_EXI_CHAN, rx, rx_len);
 	}
 	exi_deselect(RA_EXI_CHAN);
 	return ret;
@@ -600,8 +624,9 @@ static s32 ra_fetch_watchlist(void)
  * ------------------------------------------------------------------------ */
 
 /* Max addresses ESP32 can request in one ADDR_QUERY round. Must match
- * the ESP32 side's ADDR_QUERY_MAX (currently 128). */
-#define RA_ADDR_QUERY_MAX  128
+ * the ESP32 side's ADDR_QUERY_MAX (v0.28.7: 128→512 to collapse the
+ * multi-pass resolution rounds — fewer EXI round-trips per transition). */
+#define RA_ADDR_QUERY_MAX  512
 
 /* Pending ADDR_QUERY state, populated by ra_parse_response when the
  * response carries an ADDR_QUERY event. Consumed by ra_send_addr_response. */
@@ -609,28 +634,63 @@ static u32 ra_pending_query_addrs[RA_ADDR_QUERY_MAX] __attribute__((aligned(32))
 static u16 ra_pending_query_count = 0;
 
 /* Shared TX buffer — large enough for the worst-case SNAPSHOT
- * (header + max watchlist values) and reused for ADDR_RESPONSE writes
- * (which always pad to SNAPSHOT_REQ_LEN). Aligned 32 in case future DMA. */
-static u8 ra_snap_tx_buf[16 + RA_MAX_WATCH_ADDRS] __attribute__((aligned(32)));
+ * (header + max watchlist values) and reused for ADDR_RESPONSE writes.
+ * Goes out via exi_batch_write (kernel-batched immediate chunks — no
+ * alignment/length constraints; the 32B alignment + headroom are
+ * leftovers from the abandoned EXI-DMA attempt, kept as harmless). */
+static u8 ra_snap_tx_buf[16 + RA_MAX_WATCH_ADDRS + 32] __attribute__((aligned(32)));
 
-/* RX buffer — sized to comfortably hold the ESP32's response. ESP32 pads
- * the response with `last_snap_req_len` bytes of 0xFF that are consumed
- * during our TX phase; the actual ra_esp_header_t lands at offset 0 of
- * what we read during the RX phase. The longest legitimate response is
- * a WATCHLIST_APPEND for ADDR_QUERY_MAX addrs: 6 (esp_hdr) + 2 (wa_hdr)
- * + 128*4 = 520 bytes. 1024 gives generous headroom. */
-static u8 ra_snap_rx_buf[1024] __attribute__((aligned(32)));
+/* RX buffer — sized to hold the ESP32's longest response. Since v0.28.7
+ * (RA_ADDR_QUERY_MAX=512) that is an ADDR_QUERY or WATCHLIST_APPEND:
+ * 6 (esp_hdr) + 4 (append seq+count) + 512*4 = 2058 bytes. (A 256-entry
+ * REMOVE_IDX is only 6+4+256*2 = 1032.) Derived from RA_ADDR_QUERY_MAX so
+ * the two stay in lockstep, rounded up to a multiple of 32 for the aligned
+ * attr. NOTE: ra_send_phase_b reads this whole buffer every transaction,
+ * so its size is added wire-time on EVERY snapshot (~+1ms at 2080B) — the
+ * win is fewer rounds per transition, not cheaper steady-state reads. */
+#define RA_SNAP_RX_BUF_SZ  (((6 + 4 + RA_ADDR_QUERY_MAX * 4) + 31) & ~31u)
+static u8 ra_snap_rx_buf[RA_SNAP_RX_BUF_SZ] __attribute__((aligned(32)));
 
 /* Monotonic per-frame counter so ESP32 can detect dropped frames. */
 static u32 ra_frame_counter = 0;
 
+/* Latest PPC VBI counter value (true game-frame clock from the C0 hook).
+ * Updated by the VBI loop each fire. Shipped in the SNAPSHOT header
+ * (v0.26.1) so rcheevos timers count real game frames, not delivered
+ * snapshots. */
+static u32 ra_game_frame = 0;
+
+/* Phase D2 (v0.26.0) — verified watchlist sync. ra_wl_seq is the seq of
+ * the last mutation we APPLIED; echoed in every SNAPSHOT header so the
+ * ESP knows our exact position in its mutation stream. We apply a
+ * mutation iff its seq == ra_wl_seq+1 — duplicates (seq <= ours) and
+ * gaps (seq > ours+1) are dropped; the ESP redelivers the right one
+ * based on the echo. */
+static u16 ra_wl_seq = 0;
+
+/* In-game RESYNC request, set when a WATCHLIST_UPDATE event arrives
+ * mid-session (the ESP detected an unrecoverable desync). The main loop
+ * re-runs the chunk fetch and adopts the notify's seq base. */
+static u8  ra_resync_pending = 0;
+static u16 ra_resync_seq = 0;
+
+/* Countdown driving the non-blocking achievement-unlock celebration on
+ * the disc-slot LED. Set by ra_parse_response when the ESP attaches an
+ * RA_EVT_ACHIEVEMENT to a snapshot ACK; stepped once per fire in the
+ * main loop — never sleeps, so the snapshot cadence is untouched. */
+static u16 ra_led_celebrate = 0;
+
 /* Wii Starlet ARM can read PPC RAM directly: MEM1 at physical 0x00xxxxxx
  * and MEM2 at 0x10xxxxxx are mapped into Starlet's address space. The
  * ESP32 puts raw PPC physical offsets in the watchlist (0x008C2760 etc),
- * so a direct dereference suffices. If Starlet's D-cache happened to
- * hold stale PPC bytes after a long idle, an explicit invalidate would
- * be needed — but empirically the .elf.orig (which used the same direct
- * read) never showed stale data, so we don't bother. */
+ * so a direct dereference suffices.
+ *
+ * Staleness caveat (proven in the field, v0.22.2): these mappings are
+ * CACHED on Starlet. Scattered snapshot reads (~900 addresses/frame)
+ * thrash the whole D-cache so each frame's values are effectively fresh
+ * — no sync needed here. But a tight poll of a SINGLE address pins its
+ * cache line and reads stale data for tens of ms; the VBI counter poll
+ * needs os_sync_before_read before every read (see the VBI loop). */
 static u8 ra_read_ppc_byte(u32 addr)
 {
 	return *(volatile u8 *)addr;
@@ -679,19 +739,37 @@ static void ra_parse_response(const u8 *buf)
 				memcpy(&ra_pending_query_addrs[j], src + j * 4, 4);
 			}
 			ra_pending_query_count = aq.addr_count;
+			/* UNIFY (v0.30): append the queried addresses to the permanent
+			 * watchlist NOW, in query order. The ESP appends the SAME set
+			 * when it receives our ADDR_RESPONSE — no separate
+			 * WATCHLIST_APPEND mutation. Both replicas grow identically;
+			 * Phase D2's count check verifies the append, and the wl_seq
+			 * channel is now REMOVE-only. No dedup here: collect_missing
+			 * already deduped the query (a stray dup lands on BOTH sides ->
+			 * still in sync). Cap: if full we skip — the ESP hits the same
+			 * cap at the same count and skips too. Reclaiming space via
+			 * eviction is the next milestone. */
+			if ((u32)ra_watchlist_count + aq.addr_count <= RA_MAX_WATCH_ADDRS) {
+				for (j = 0; j < aq.addr_count; j++) {
+					ra_watchlist[ra_watchlist_count + j] = ra_pending_query_addrs[j];
+				}
+				ra_watchlist_count += aq.addr_count;
+			}
 		}
 	}
 	else if (resp.event_type == RA_EVT_WATCHLIST_APPEND) {
-		/* No dedup here — ESP32 (v0.17.1+) has mismatch_last_sent_count
-		 * dup-suppression so duplicates never reach us. Adding a dedup
-		 * here caused sync drift with REMOVE: rejected entries left
-		 * ra_watchlist_count behind ESP32's view, then REMOVE for the
-		 * "tail" couldn't find some addresses, ra-module ended at a
-		 * different count than expected, canonical padding desynced,
-		 * multi-pass died (observed v0.18 2026-06-01). Trust ESP32. */
+		/* Phase D2 (v0.26.0): apply iff seq == ra_wl_seq+1. A stale
+		 * duplicate (seq <= ours) or a gap (seq > ours+1) is silently
+		 * dropped — the ESP redelivers the right mutation based on the
+		 * wl_seq echo in our next SNAPSHOT. This makes delivery
+		 * idempotent BY CONSTRUCTION (the v0.24.6 duplicated-append
+		 * corruption class cannot exist). */
 		ra_watchlist_append_t wa;
 		memcpy(&wa, buf + sizeof(resp), sizeof(wa));
-		if (wa.addr_count > 0
+		if (wa.seq != (u16)(ra_wl_seq + 1)) {
+			/* drop — out-of-sequence delivery */
+		}
+		else if (wa.addr_count > 0
 		    && (u32)ra_watchlist_count + wa.addr_count <= RA_MAX_WATCH_ADDRS) {
 			const u8 *src = buf + sizeof(resp) + sizeof(wa);
 			u16 j;
@@ -701,6 +779,7 @@ static void ra_parse_response(const u8 *buf)
 				ra_watchlist[ra_watchlist_count + j] = addr;
 			}
 			ra_watchlist_count += wa.addr_count;
+			ra_wl_seq = wa.seq;
 		} else {
 			/* DIAG (anomaly-only): APPEND rejected. Either zero-count
 			 * (protocol violation) or would overflow RA_MAX_WATCH_ADDRS
@@ -718,46 +797,59 @@ static void ra_parse_response(const u8 *buf)
 			ra_debug_send(m, (u8)o);
 		}
 	}
-	else if (resp.event_type == RA_EVT_WATCHLIST_REMOVE) {
-		/* Phase A.5: ESP32 evicted N specific addresses (LRU). For each,
-		 * find it in ra_watchlist[] (linear search) and shift the survivors
-		 * down. Insertion order of survivors preserved → matches ESP32's
-		 * post-defrag layout, so SNAPSHOT positions stay aligned.
-		 *
-		 * Implementation: build a "to_remove" bitmap (small, 1024 bits),
-		 * then single-pass compact. O(N + R*N) where N=watch_count,
-		 * R=remove_count. Fine for N≤1024, R≤256. */
-		ra_watchlist_remove_t wr;
-		memcpy(&wr, buf + sizeof(resp), sizeof(wr));
-		if (wr.addr_count > 0
-		    && wr.addr_count <= ra_watchlist_count) {
-			const u8 *src = buf
-			              + sizeof(resp) + sizeof(wr);
-			u16 r, i;
-			static u8 to_remove[RA_MAX_WATCH_ADDRS];  /* one byte per entry */
-			memset(to_remove, 0, ra_watchlist_count);
-			for (r = 0; r < wr.addr_count; r++) {
-				u32 addr;
-				memcpy(&addr, src + r * 4, 4);
-				for (i = 0; i < ra_watchlist_count; i++) {
-					if (ra_watchlist[i] == addr && !to_remove[i]) {
-						to_remove[i] = 1;
-						break;
-					}
-				}
-			}
-			/* Compact: shift survivors down. */
-			u16 write_idx = 0;
+	/* (v0.27.0: the legacy address-based RA_EVT_WATCHLIST_REMOVE (0x0D)
+	 * parse was removed — the ESP only emits REMOVE_IDX since v0.25.0,
+	 * and the O(R*N) address search cost ~2 frames at N=6144. The enum
+	 * value stays reserved in gc_ra_protocol.h; do not renumber.) */
+	else if (resp.event_type == RA_EVT_WATCHLIST_REMOVE_IDX) {
+		/* v0.25.0 — removal by array INDEX. Both replicas are identical
+		 * before the removal, so the ESP sends the u16 indices (BE,
+		 * ascending) of the entries to drop. Single-pass compaction
+		 * with a skip cursor: O(N), vs the address-based REMOVE's
+		 * O(R*N) linear search (~25-30ms ≈ 2 frames at N=6144 — the
+		 * "cleanup doesn't fit in a frame" weak point). Index identity
+		 * also kills the duplicate-address ambiguity class. */
+		ra_watchlist_remove_idx_t wri;
+		memcpy(&wri, buf + sizeof(resp), sizeof(wri));
+		if (wri.seq != (u16)(ra_wl_seq + 1)) {
+			/* Phase D2: out-of-sequence — drop; ESP redelivers. */
+		}
+		else if (wri.idx_count > 0 && wri.idx_count <= ra_watchlist_count) {
+			const u8 *src = buf + sizeof(resp) + sizeof(wri);
+			u16 i, skip = 0, write_idx = 0;
 			for (i = 0; i < ra_watchlist_count; i++) {
-				if (!to_remove[i]) {
-					if (write_idx != i) {
-						ra_watchlist[write_idx] = ra_watchlist[i];
+				if (skip < wri.idx_count) {
+					u16 idx;
+					memcpy(&idx, src + skip * 2, 2);
+					if (idx == i) {
+						skip++;
+						continue;
 					}
-					write_idx++;
 				}
+				if (write_idx != i)
+					ra_watchlist[write_idx] = ra_watchlist[i];
+				write_idx++;
 			}
 			ra_watchlist_count = write_idx;
+			ra_wl_seq = wri.seq;
 		}
+	}
+	else if (resp.event_type == RA_EVT_WATCHLIST_UPDATE) {
+		/* Phase D2 in-game RESYNC: the ESP detected an unrecoverable
+		 * desync and published a fresh full list. Defer the chunk
+		 * re-fetch to the main loop (it takes ~300ms of legacy ra_send
+		 * round-trips — too long for this parse context). */
+		ra_watchlist_notify_t wn;
+		memcpy(&wn, buf + sizeof(resp), sizeof(wn));
+		ra_resync_seq = wn.seq;
+		ra_resync_pending = 1;
+	}
+	else if (resp.event_type == RA_EVT_ACHIEVEMENT) {
+		/* Achievement unlocked! The payload (id + title) is for richer
+		 * clients; here the edge is all we need — celebrate on the
+		 * disc-slot LED. The main loop steps the pattern one tick per
+		 * fire (see the VBI loop), so nothing blocks. */
+		ra_led_celebrate = 54;  /* 9 frames ON / 9 OFF x3 ≈ 0.9s at 60Hz */
 	}
 }
 
@@ -782,20 +874,40 @@ static s32 ra_send_snapshot(void)
 	hdr->payload_len = sizeof(ra_snapshot_header_t) + count;
 
 	snap = (ra_snapshot_header_t *)(ra_snap_tx_buf + sizeof(ra_gc_header_t));
-	snap->frame_counter = ++ra_frame_counter;
+	/* v0.26.1: frame_counter carries the PPC VBI counter (TRUE game
+	 * frames, including ones we never fired on) so the ESP can call
+	 * rc_client_do_frame once per GAME frame via debt catch-up.
+	 * rcheevos hit-count timers assume do_frame==60Hz; our delivered
+	 * rate is 55-95% of that, which made "3600 hits = 60s" timers run
+	 * 60-109 real seconds (false-easy unlock: SMG bunnies 2026-06-12).
+	 * Falls back to the fire counter when the VBI hook isn't running
+	 * (ra_game_frame stays 0) — ESP treats a frozen value as +1/frame. */
+	++ra_frame_counter;
+	snap->frame_counter = (ra_game_frame != 0) ? ra_game_frame
+	                                           : ra_frame_counter;
 	snap->addr_count    = count;
+	snap->wl_seq        = ra_wl_seq;  /* Phase D2 sync echo */
 
 	values = ra_snap_tx_buf + sizeof(ra_gc_header_t)
 	                        + sizeof(ra_snapshot_header_t);
-	for (i = 0; i < count; i++) {
-		values[i] = ra_read_ppc_byte(ra_watchlist[i]);
+	{   /* v0.28.9 — time reading the whole watchlist from PPC MEM1 */
+		u32 _m0 = vi_read_hw_timer();
+		for (i = 0; i < count; i++) {
+			values[i] = ra_read_ppc_byte(ra_watchlist[i]);
+		}
+		g_t_mem1_ms = vi_ticks_to_us(vi_read_hw_timer() - _m0) / 1000u;
 	}
 
 	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count;
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
-	ret = ra_send_phase_b(ra_snap_tx_buf, tx_len, ra_snap_rx_buf, rx_len);
+	{   /* v0.28.9 — time the Phase-B round-trip (write + wait + read). Cycle
+	     * budget ≈ g_t_mem1_ms + g_t_snap_ms; wait is the slice inside it. */
+		u32 _s0 = vi_read_hw_timer();
+		ret = ra_send_phase_b(ra_snap_tx_buf, tx_len, ra_snap_rx_buf, rx_len);
+		g_t_snap_ms = vi_ticks_to_us(vi_read_hw_timer() - _s0) / 1000u;
+	}
 	if (ret < 0) return ret;
 
 	ra_parse_response(ra_snap_rx_buf);
@@ -845,66 +957,64 @@ static s32 ra_send_addr_response(void)
 	return 0;
 }
 
-/* Encode a decimal count as digit blinks (hundreds, tens, ones).
- * Each digit: N medium blinks (250ms each), 800ms separator between digits.
- * Digit 0 shows as a brief blip (50ms) so the user sees "something here". */
-static void ra_led_encode_count(u32 count)
-{
-	int digits[3];
-	int d, k;
-
-	digits[0] = (count / 100) % 10;
-	digits[1] = (count /  10) % 10;
-	digits[2] =  count        % 10;
-
-	for (d = 0; d < 3; d++) {
-		if (digits[d] == 0) {
-			/* Tiny blip to make "zero digit" visible. */
-			Swi_LedOn();  ra_sleep(50);
-			Swi_LedOff(); ra_sleep(50);
-		} else {
-			for (k = 0; k < digits[d]; k++) {
-				Swi_LedOn();  ra_sleep(250);
-				Swi_LedOff(); ra_sleep(250);
-			}
-		}
-		ra_sleep(800);  /* digit separator */
-	}
-}
+/* (v0.26.2: ra_led_encode_count removed — the decimal blink encode of the
+ * watchlist count burned ~13s of boot; the ESP serial log carries it.) */
 
 static u32 ra_poll_thread(void *arg)
 {
 	(void)arg;
 
-	/* Instrumented version — VISIBLE blink markers around each step so we
-	 * can see exactly where the thread is in its execution by watching the
-	 * disc-slot LED. Markers are 4 fast blinks at ~3Hz between phases.
-	 * gcc 4.5.1 (devkitARM r32) is C89 — declare loop var at block top. */
-	s32 i;
+	/* LED language since v0.26.2 (the boot blink theater was removed):
+	 * 1 blip = game detected, 2 blips = watchlist fetched,
+	 * 7 fast blinks = fetch error, 3 pulses = achievement unlock. */
 
-	/* GRACE: 10 slow blinks (~10s). After the 2026-05-29 SWI breakthrough,
-	 * writes to Hollywood registers no longer crash the kernel during boot,
-	 * so we can shorten this. Keep some delay to let the game settle and
-	 * give the user a chance to see the LED come alive. */
-	for (i = 0; i < 10; i++) {
-		Swi_LedOn();  ra_sleep(500);
-		Swi_LedOff(); ra_sleep(500);
+	/* WAIT FOR GAME-ALIVE (v0.26.2, unbounded since v0.27.1). The VBI
+	 * counter at phys 0x2FF8 IS the boot callback: the booter zeroes it,
+	 * and the game's first __VIRetraceHandler run (= the wiimote warning
+	 * screen appearing) starts incrementing it via the C0 hook. Plain
+	 * MEM1 reads with cache invalidate — no EXI, no SWI, perfectly safe
+	 * while the apploader (or WiiFlow itself!) is running. We require 4
+	 * observed changes (robust against the booter's zeroing of stale
+	 * garbage counting as one).
+	 *
+	 * NO TIMEOUT, deliberately — the static-counter case means "this IOS
+	 * instance is not hosting an RA game" and the module must stay
+	 * SILENT FOREVER (zero EXI traffic). That single property is what
+	 * makes it safe to install RAMOD into the STANDARD cIOS slots
+	 * (248-251), including WiiFlow's own mainIOS: while WiiFlow browses,
+	 * the counter never moves → we never touch the bus → no contention
+	 * with WiiFlow's probe/LOAD_GAME ([[project-bus-contention-mainIOS]]
+	 * solved structurally — no per-game .ini forcing needed). Boots
+	 * without the ESP (WiiFlow doesn't inject the hook) and games where
+	 * the hook pattern fails also stay silent — acceptable: RA simply
+	 * isn't running for those. */
+	{
+		u32 prev, cur;
+		s32 changes = 0;
+		os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
+		prev = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
+		while (changes < 4) {
+			ra_sleep(50);
+			os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
+			cur = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
+			if (cur != prev) {
+				changes++;
+				prev = cur;
+			}
+		}
 	}
+
+	/* Single short blip: ra-module alive, game detected. */
+	Swi_LedOn();  ra_sleep(100);
+	Swi_LedOff();
 
 	/* Initialize EXI subsystem. Just reads HW_EXICTRL to confirm bus master
 	 * is on — actual transactions configure CSR per-call via exi_select. */
 	exi_init();
 
-	/* PROGRAM-START MARKER: 2-second solid ON. After this, the loop runs
-	 * forever sending IDENTIFY once per second. */
-	Swi_LedOn();
-	ra_sleep(2000);
-	Swi_LedOff();
-	ra_sleep(500);
-
 	/* One IDENTIFY round-trip to confirm EXI link is healthy. */
 	(void)ra_identify();
-	ra_sleep(500);
+	ra_sleep(100);
 
 	/* WATCHLIST FETCH. ESP32 is in state GAME_LOADED at this point —
 	 * rcheevos has already loaded the achievement set and computed the
@@ -913,191 +1023,199 @@ static u32 ra_poll_thread(void *arg)
 		s32 wl_ret = ra_fetch_watchlist();
 
 		if (wl_ret < 0) {
-			/* Fetch failed. 7 fast blinks = error. */
+			/* Fetch failed. 7 fast blinks = error (kept — this is the
+			 * one signal worth reading off the LED in the field). */
 			int k;
 			for (k = 0; k < 7; k++) {
 				Swi_LedOn();  ra_sleep(120);
 				Swi_LedOff(); ra_sleep(120);
 			}
-			ra_sleep(1000);
-		} else if (ra_watchlist_count == 0) {
-			/* Got the chunk but it was empty. 2s solid ON = "0 addrs". */
-			Swi_LedOn();
-			ra_sleep(2000);
-			Swi_LedOff();
-			ra_sleep(500);
 		} else {
-			/* Success! 5 fast blinks ("got it") + 1 long marker + count
-			 * encoded as decimal digits. */
-			int k;
-			for (k = 0; k < 5; k++) {
-				Swi_LedOn();  ra_sleep(120);
-				Swi_LedOff(); ra_sleep(120);
-			}
-			ra_sleep(800);
-			/* 1 long ON (1s) = "here comes the count". */
-			Swi_LedOn();  ra_sleep(1000);
-			Swi_LedOff(); ra_sleep(500);
-			ra_led_encode_count(ra_watchlist_count);
-			ra_sleep(1000);
+			/* Success — double blip and straight into the main loop.
+			 * (v0.26.2: the old 5-blink + 1s marker + decimal LED count
+			 * encode burned ~13 MORE seconds before the first SNAPSHOT;
+			 * the count is visible in the ESP serial log anyway.) */
+			Swi_LedOn();  ra_sleep(80);
+			Swi_LedOff(); ra_sleep(80);
+			Swi_LedOn();  ra_sleep(80);
+			Swi_LedOff();
 		}
 	}
 
-	/* Main SNAPSHOT loop. Two scheduling modes selected at compile time:
-	 *
-	 *   USE_VBLANK_SYNC defined (default v0.20.0):
-	 *     Hybrid adaptive scheduler modeled on nes-ra-adapter's OAMDMA-write
-	 *     detector with time-based fallback. Polls VI's vpos register; fires
-	 *     a SNAPSHOT either (a) when vblank is detected AND enough time has
-	 *     passed since the last fire to plausibly be a new frame, or (b)
-	 *     when 2 frame-times have elapsed without VI giving us a signal
-	 *     (loading screens, mode changes, anything that suspends VI).
-	 *
-	 *     The strict/relaxed delta tuning mirrors NES: when we just fired
-	 *     via VBLANK we treat the next vblank pulse strictly (need
-	 *     >= FRAME_US - 2500 us since last frame); when we just fired via
-	 *     TIMER we relax (>= FRAME_US - 8000 us). This prevents double-fire
-	 *     when VI gives us a glitch right after we forced a timer fire.
-	 *
-	 *   USE_VBLANK_SYNC undefined:
-	 *     Fixed 16ms ra_sleep cadence (~52Hz effective). Safe fallback.
-	 *
-	 * Multi-pass inner loop is identical in both modes — drain pending
-	 * ADDR_QUERY rounds before computing next-frame timing. Cap at 12
-	 * rounds matches ESP32's ADDR_QUERY_MAX_ITERATIONS. */
+	/* (v0.27.0: the one-shot OCA boot dump was removed — it ran BEFORE the
+	 * apploader finished, so its view was pre-boot residue; the periodic
+	 * OCAP line in the 5s diag covers the steady state and stays.) */
+
+	/* Main SNAPSHOT loop — VBI-edge scheduling with built-in 2-frame timer
+	 * fallback (the only mode since v0.27.0; the HW_TIMER pacer and the
+	 * fixed-16ms fallback builds were retired after the VBI lock was
+	 * validated on hw). Multi-pass inner loop drains pending ADDR_QUERY
+	 * rounds before computing next-frame timing; cap at 12 rounds matches
+	 * ESP32's ADDR_QUERY_MAX_ITERATIONS. */
 
 #define FRAME_US                16667u   /* 60Hz NTSC frame */
 
-#if defined(USE_TIMER_PACING)
 	{
-		/* Hollywood HW_TIMER-based 60Hz pacer. Reads tick at frame start,
-		 * does work, sleeps the residual. The sleep is computed each
-		 * iteration so a slow frame doesn't drift cadence — if a frame
-		 * exceeds FRAME_US, the next one starts immediately and
-		 * subsequent frames re-converge.
+		/* PPC VBI counter sync — the nes-ra-adapter hybrid pattern.
 		 *
-		 * Probe pass at startup: v0.20.3 added vi_probe_addrs() to scan
-		 * VI register candidates so we can find the right Starlet-side
-		 * mapping. Result goes to ra_debug_send; doesn't affect pacing. */
-		u32 next_fire_tick;
-		u32 frame_ticks;
-
-		/* vi_probe_addrs() — DISABLED v0.20.5.
+		 * WiiFlow's Ocarina codehandler executes our C0 cheat code at
+		 * every vertical retrace; it increments a u32 at physical 0x2FF8
+		 * through the PPC's uncached MEM1 mirror. We poll that address
+		 * (plain MEM1 read, same path as ra_read_ppc_byte — no SWI) and
+		 * fire on change. The counter value itself doubles as a frame
+		 * sequence number; a jump > 1 between polls means we missed
+		 * frames (e.g. multi-pass ran long).
 		 *
-		 * v0.20.4 testing crashed the IOS kernel: reading from
-		 * unvalidated MMIO addresses via Swi_MLoad triggered a data
-		 * abort in SVC mode. The kernel died, the game froze at
-		 * random points after boot. Same symptom class as the
-		 * 2026-05-12 EXI-physical-address incident documented in
-		 * [[project-exi-address-check]] — "game boots, Wiimote
-		 * safety screen, then hangs".
-		 *
-		 * The probe function stays defined in vi.c so it can be
-		 * re-enabled later for *carefully curated* address lists
-		 * (only addresses verified via mini sources or external
-		 * Wii hardware documentation). Not invoked from any code
-		 * path right now. */
-		/* vi_probe_addrs();  // hazardous — see [[project-vi-probe-crashed-kernel]] */
+		 * Fallback: if the counter hasn't moved for 2 frame-times, fire
+		 * on time anyway. Covers: hook not installed (WiiFlow without RA,
+		 * pattern-match failure on exotic games), loading screens that
+		 * suspend the VI handler, and the window before the game boots.
+		 * The fallback engages silently and disengages the moment the
+		 * counter moves again. */
+		#define VBI_POLL_MS          1u
+		#define FALLBACK_FACTOR      2u
 
-		/* Pre-compute frame interval in HW_TIMER ticks. 1 tick ≈ 526.7 ns
-		 * so FRAME_US * 1000 / 527 ≈ 31626 ticks per 16667us frame.
-		 * 16667 * 1000 = 16,667,000 fits in u32 (max 4.29B). */
-		frame_ticks = (FRAME_US * 1000u) / 527u;
+		/* The counter MUST be cache-invalidated before every read. Starlet
+		 * maps PPC RAM cached; a tight poll of one address keeps its line
+		 * pinned in the D-cache and we see the counter frozen for tens of
+		 * ms until something happens to evict the line. (v0.22.2 field
+		 * data: counter advanced at 59Hz — Δc≈295/5s — yet ~80% of fires
+		 * were the 33ms fallback because the poll read stale values. The
+		 * snapshot reads get away without syncing only because scanning
+		 * ~900 scattered addresses thrashes the whole D-cache each frame.) */
+		u32 last_ctr, ctr;
+		u32 last_fire_tick;
+		u32 fires = 0, vbi_fires = 0;
+		u32 last_diag_tick;
 
-		next_fire_tick = vi_read_hw_timer() + frame_ticks;
-
-		while (1) {
-			s32 i;
-			u32 now_tick;
-			s32 ticks_to_fire;
-
-			(void)ra_send_snapshot();
-			for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
-				(void)ra_send_addr_response();
-			}
-
-			/* Compute time remaining until next fire. Signed math handles
-			 * HW_TIMER wraparound correctly for windows much shorter than
-			 * the timer's ~37-minute period. */
-			now_tick = vi_read_hw_timer();
-			ticks_to_fire = (s32)(next_fire_tick - now_tick);
-
-			if (ticks_to_fire > 0) {
-				u32 us_to_fire = vi_ticks_to_us((u32)ticks_to_fire);
-				ra_sleep_us((s32)us_to_fire);
-				next_fire_tick += frame_ticks;
-			} else if (-ticks_to_fire > (s32)frame_ticks) {
-				/* Missed by more than a full frame — abandon catch-up,
-				 * re-anchor cadence to "now". Otherwise we'd burn through
-				 * a backlog of immediate fires with no sleep. */
-				next_fire_tick = now_tick + frame_ticks;
-			} else {
-				/* Within a frame's overrun — just advance and fire
-				 * immediately. Next frame should re-converge. */
-				next_fire_tick += frame_ticks;
-			}
-
-			/* No periodic vi_dump_state in TIMER_PACING mode — we
-			 * don't call vi_vblank_edge, so the counters stay at 0
-			 * and the dump is uninformative noise. vi_probe_addrs()
-			 * at the top of this block is the one-shot diagnostic
-			 * for VI address discovery. */
-		}
-	}
-#elif defined(USE_VBLANK_SYNC)
-	{
-		#define FALLBACK_FACTOR             2u   /* force fire after N frame-times */
-		#define VI_POLL_MS                  1u
-		#define VI_DIAG_FIRES_PER_DUMP    60u
-
-		u32 last_frame_tick = vi_read_hw_timer();
-		u32 fires_since_dump = 0;
+		os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
+		last_ctr = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
+		last_fire_tick = vi_read_hw_timer();
+		last_diag_tick = last_fire_tick;
 
 		while (1) {
 			s32 i;
 			u32 now_tick, diff_us;
-			s32 fire_now;
+			s32 fire_now = 0;
 
+			os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
+			ctr = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
 			now_tick = vi_read_hw_timer();
-			diff_us  = vi_ticks_to_us(now_tick - last_frame_tick);
+			diff_us = vi_ticks_to_us(now_tick - last_fire_tick);
 
-			fire_now = vi_vblank_edge();
-			if (!fire_now && diff_us > (FRAME_US * FALLBACK_FACTOR)) {
+			if (ctr != last_ctr) {
+				last_ctr = ctr;
+				fire_now = 1;
+				vbi_fires++;
+			} else if (diff_us > (FRAME_US * FALLBACK_FACTOR)) {
 				fire_now = 1;
 			}
+			ra_game_frame = last_ctr;  /* true game-frame clock (v0.26.1) */
 
 			if (!fire_now) {
-				ra_sleep(VI_POLL_MS);
+				ra_sleep(VBI_POLL_MS);
 				continue;
 			}
 
-			last_frame_tick = now_tick;
+			last_fire_tick = now_tick;
+			fires++;
 
 			(void)ra_send_snapshot();
 			for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
 				(void)ra_send_addr_response();
 			}
 
-			if (VI_DIAG_FIRES_PER_DUMP > 0) {
-				fires_since_dump++;
-				if (fires_since_dump >= VI_DIAG_FIRES_PER_DUMP) {
-					fires_since_dump = 0;
-					vi_dump_state();
+			/* Achievement-unlock celebration on the disc-slot LED —
+			 * one pattern step per fire, no sleeps. From 54: toggles
+			 * at 45/36/27/18/9/0 → three 9-frame ON pulses, ends OFF.
+			 * Swi_LedOn/Off are single SVCs on phase boundaries only. */
+			if (ra_led_celebrate) {
+				ra_led_celebrate--;
+				if ((ra_led_celebrate % 9) == 0) {
+					if ((ra_led_celebrate / 9) & 1)
+						Swi_LedOn();
+					else
+						Swi_LedOff();
+				}
+			}
+
+			/* Phase D2 in-game RESYNC — re-fetch the full watchlist via
+			 * chunks (~300ms of legacy round-trips, one-time repair) and
+			 * adopt the ESP's seq base. Frames during the fetch are simply
+			 * skipped; the next SNAPSHOT echoes the new seq and the ESP
+			 * resumes verified-sync evaluation. */
+			if (ra_resync_pending) {
+				ra_resync_pending = 0;
+				if (ra_fetch_watchlist() == 0) {
+					ra_wl_seq = ra_resync_seq;
+				}
+				/* On fetch failure ra_wl_seq stays stale — the ESP sees
+				 * the unchanged echo and re-triggers the resync. */
+			}
+
+			/* Diag every ~5s: counter value + fires + how many came from
+			 * the VBI edge (vs timer fallback). "VBI c=xxxxxxxx f=N v=M":
+			 * v==f means perfect vblank lock; v==0 means hook not
+			 * installed (running on fallback). */
+			if (vi_ticks_to_us(now_tick - last_diag_tick) > 5000000u) {
+				u8 m[48];
+				u32 o = 0;
+				u8 cb[4];
+				last_diag_tick = now_tick;
+				cb[0] = (ctr >> 24) & 0xFF; cb[1] = (ctr >> 16) & 0xFF;
+				cb[2] = (ctr >>  8) & 0xFF; cb[3] =  ctr        & 0xFF;
+				m[o++] = 'V'; m[o++] = 'B'; m[o++] = 'I'; m[o++] = ' ';
+				m[o++] = 'c'; m[o++] = '=';
+				o += ra_dbg_hex_bytes(m + o, cb, 4, 0);
+				m[o++] = ' '; m[o++] = 'f'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)fires);
+				m[o++] = ' '; m[o++] = 'v'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)vbi_fires);
+				ra_debug_send(m, (u8)o);
+
+				/* v0.28.9 — Phase-B timing (ms): w=wait(INT latency)
+				 * m=mem1(read watchlist) s=snap(write+wait+read). The ESP
+				 * cycle (cyc_us) ≈ m+s; if w≈s≈100ms the INT is the gap. */
+				o = 0;
+				m[o++] = 'P'; m[o++] = 'H'; m[o++] = 'B'; m[o++] = ' ';
+				m[o++] = 'w'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)g_t_wait_ms);
+				m[o++] = ' '; m[o++] = 'm'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)g_t_mem1_ms);
+				m[o++] = ' '; m[o++] = 's'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)g_t_snap_ms);
+				ra_debug_send(m, (u8)o);
+
+				/* OCAP: live peeks at the Ocarina chain landmarks. Unlike
+				 * the one-shot OCA dump above (which runs BEFORE the booter's
+				 * apploader finishes, so it sees pre-boot residue), this
+				 * shows the steady state:
+				 *   word 0 @0x1800 — Disc_ID start (game ID ASCII)
+				 *   word 1 @0x22A8 — codelist, debugger=0 (00D0C0DE = GCT)
+				 *   word 2 @0x28B8 — codelist, debugger=1
+				 *   word 3 @0x2FE0 — booter breadcrumb 5242hhpp
+				 *                    ('RB' | hooktype | hookpatched)
+				 *   word 4 @0x2FE4 — GCT size the booter received */
+				{
+					u8 m2[64];
+					u32 o2 = 0, d2, j2;
+					u32 oca2[5];
+					oca2[0] = 0x1800; oca2[1] = 0x22A8; oca2[2] = 0x28B8;
+					oca2[3] = 0x2FE0; oca2[4] = 0x2FE4;
+					m2[o2++] = 'O'; m2[o2++] = 'C'; m2[o2++] = 'A'; m2[o2++] = 'P';
+					for (d2 = 0; d2 < 5; d2++) {
+						m2[o2++] = ' ';
+						os_sync_before_read((void *)oca2[d2], 4);
+						for (j2 = 0; j2 < 4; j2++) {
+							u8 b2 = *(volatile u8 *)(oca2[d2] + j2);
+							o2 += ra_dbg_hex_bytes(m2 + o2, &b2, 1, 0);
+						}
+					}
+					ra_debug_send(m2, (u8)o2);
 				}
 			}
 		}
 	}
-#else
-	/* Fixed-cadence fallback. ~41Hz effective. */
-	while (1) {
-		s32 i;
-		(void)ra_send_snapshot();
-		for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
-			(void)ra_send_addr_response();
-		}
-		ra_sleep(16);
-	}
-#endif
 	return 0;
 }
 
@@ -1148,7 +1266,10 @@ static s32 __RA_Initialize(u32 *queuehandle)
 
 int main(void)
 {
-	u32 queuehandle;
+	/* Initialized: if __RA_Initialize fails before assigning it, the IPC
+	 * loop below blocks on queue 0 instead of reading garbage (also
+	 * silences the long-standing may-be-used-uninitialized warning). */
+	u32 queuehandle = 0;
 	s32 ret;
 	s32 thread_id;
 	s32 priority;

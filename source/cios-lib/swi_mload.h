@@ -47,6 +47,15 @@ typedef s32(*TRCheckFunc)(s32 tid, u32 rights);
  * finishes and the DATA register is captured. Returns the 4-byte
  * DATA contents packed big-endian (top byte = first byte read). */
 #define Swi_ExiCrRead(CHAN, CR_VAL)                   Swi_MLoad(  8, (CHAN), (CR_VAL), 0)
+/* EXI immediate-mode BATCH transfers — the entire buffer loop (pack,
+ * DATA+CR trigger, bounded poll per 4-byte chunk) runs inside ONE SVC.
+ * From user mode the same loop costs ~5 SVC round-trips per chunk
+ * (trigger + CR polls), i.e. ~1000 SVCs for a 790-byte write; batched
+ * it's len/256 SVCs. Caller should slice into <=256-byte calls to bound
+ * the IRQs-masked window (~260us per call at 8MHz — see mload swi.c).
+ * Returns 0 on success, negative if a chunk timed out. */
+#define Swi_ExiBatchWrite(CHAN, SRC, LEN)             Swi_MLoad( 10, (CHAN), (u32)(SRC), (LEN))
+#define Swi_ExiBatchRead(CHAN, DST, LEN)              Swi_MLoad( 11, (CHAN), (u32)(DST), (LEN))
 #define Swi_GetSyscallBase()                          Swi_MLoad( 17,   0,   0, 0)
 #define Swi_SetRunningTitle(V)                        Swi_MLoad( 32, (V),   0, 0)
 #define Swi_GetRunningTitle()                         Swi_MLoad( 33,   0,   0, 0)
