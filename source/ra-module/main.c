@@ -52,6 +52,34 @@
  * grow into it, and the booter zeroes it at boot via the codelist memset. */
 #define RA_VBI_COUNTER_PHYS  0x00002FF8u
 
+/* Galaxy-freeze forensics (2026-06-18).
+ * RA_HEARTBEAT_LED RESULT: at the galaxy freeze the LED STOPPED blinking = the
+ *   main loop is NOT cycling = a TRUE Starlet hang inside a fire (not alive-loop).
+ *   So: every op is bounded yet it hangs -> an EXCEPTION (data abort) or a sleep
+ *   that never returns. Prime suspect: a read fault on a garbage HIGH MEM2 addr
+ *   (the storm queries 0x13A1879B / 0x13F20475 = IOS-reserved region above MLOAD).
+ * RA_READ_LED_DIAG (now OFF): LED ON while inside a ra_read_ppc_byte loop. Was the
+ *   snapshot-freeze forensic (SOLID ON at the freeze = hung on a memory READ). The
+ *   freeze it chased is resolved, so it's retired — kept guarded for revert.
+ * RA_INT_TIMEOUT_LED (NOW ON): blip the disc-slot LED for ~1s on every new INT-wait
+ *   timeout (exi_wait_int hitting its RA_INT_TIMEOUT_MS=50ms cap, counted in
+ *   g_to_phaseb / g_to_dbg). Lets us SEE how often the ESP→Wii INT line fails to
+ *   assert in time, by eye, without a serial cable. Non-blocking: a wall-clock
+ *   deadline stepped in the main loop drives the off edge — never a 1s busy-wait,
+ *   which would starve other IOS threads. */
+#define RA_READ_LED_DIAG    0
+#define RA_INT_TIMEOUT_LED  1
+#define RA_HEARTBEAT_LED    0
+
+/* RA_SPIKE_LOG (default OFF): event-triggered "SPK ms=.. r=.. w=.. tb=.. td=.."
+ * dump whenever a fire's convergence ran > 30ms. Useful, but NOT free: each dump
+ * is a ra_debug_send that blocks on a 50ms debug-ACK INT wait, and during heavy
+ * scenes (SMG bunnies) the ESP is too busy to ACK in time — so the logging itself
+ * manufactures g_to_dbg INT timeouts (the bulk of the 2026-06-20 LED blinks were
+ * this observer effect, not real snapshot losses). Turn ON only when actively
+ * chasing a spike; leave OFF for normal play. */
+#define RA_SPIKE_LOG        0
+
 char *moduleName = "RA_MOD";
 
 /* ------------------------------------------------------------------------
@@ -240,6 +268,19 @@ u32 ra_dbg_hex_bytes(u8 *dst, const u8 *src, u32 n, u8 sep)
 	return o;
 }
 
+/* 2026-06-19 spike forensics. The periodic PHB diag samples g_t_wait_ms every ~5s
+ * → it MISSES the rare convergence-frame spikes (it=2 yet ap_us=139ms — impossible
+ * for 2 round-trips; smells like ONE exi_wait_int hitting its timeout). Two INT-wait
+ * sites: Phase B (the snapshot/addr-response round trip) and the debug-ACK (after
+ * every ra_debug_send — and we log DEBUG=ADDR_QUERY per convergence round, so the
+ * logging itself could be stalling the ESP's arm). Count timeouts at each site and
+ * dump a SPK line ONLY when the convergence loop runs long. Reduced the timeout
+ * 100→50 so a stall costs 50ms not 100 — if the spike halves with it, it WAS a
+ * timeout. Declared up here (before ra_debug_send) since the debug-ACK uses them. */
+#define RA_INT_TIMEOUT_MS  50u
+volatile u32 g_to_phaseb = 0;   /* Phase B INT-wait timeouts (lifetime) */
+volatile u32 g_to_dbg    = 0;   /* debug-ACK INT-wait timeouts (lifetime) */
+
 u32 ra_dbg_u16_dec(u8 *dst, u16 v)
 {
 	u8 tmp[6];
@@ -296,8 +337,8 @@ void ra_debug_send(const u8 *msg, u8 msg_len)
 	 * wii.log timestamp 00:20:15).
 	 *
 	 * We don't bother reading the ACK; we just need to know the ESP is
-	 * armed and ready. 100ms timeout is the same budget as Phase B itself. */
-	(void)exi_wait_int(RA_EXI_CHAN, 100);
+	 * armed and ready. Timeout budget shared with Phase B. */
+	if (exi_wait_int(RA_EXI_CHAN, RA_INT_TIMEOUT_MS) < 0) g_to_dbg++;
 	exi_clear_int(RA_EXI_CHAN);
 }
 
@@ -366,10 +407,10 @@ static s32 ra_send_phase_b(void *tx, u32 tx_len, void *rx, u32 rx_len)
 	{   /* v0.28.9 — time the wait: if this is ~100ms the INT is arriving
 	     * late (or timing out), which would explain the ~107ms cycle gap. */
 		u32 _wt0 = vi_read_hw_timer();
-		ret = exi_wait_int(RA_EXI_CHAN, 100);
+		ret = exi_wait_int(RA_EXI_CHAN, RA_INT_TIMEOUT_MS);
 		g_t_wait_ms = vi_ticks_to_us(vi_read_hw_timer() - _wt0) / 1000u;
 	}
-	if (ret < 0) return ret;
+	if (ret < 0) { g_to_phaseb++; return ret; }
 
 	/* CLEAR phase — RW1C the EXI_IRQ bit so the next round's wait starts
 	 * from a clean slate. Must happen BEFORE the read CS-low so we don't
@@ -680,6 +721,17 @@ static u16 ra_resync_seq = 0;
  * main loop — never sleeps, so the snapshot cadence is untouched. */
 static u16 ra_led_celebrate = 0;
 
+/* INT-timeout diagnostic blink state (RA_INT_TIMEOUT_LED). ra_led_to_seen
+ * tracks the last-observed lifetime INT-timeout total (g_to_phaseb +
+ * g_to_dbg); when it grows, the disc-slot LED lights and ra_led_to_on_tick
+ * records the hw-timer tick, so the main loop can turn it back off ~1s later
+ * without ever blocking. */
+#if RA_INT_TIMEOUT_LED
+static u32 ra_led_to_seen    = 0;
+static u32 ra_led_to_on_tick = 0;
+static u8  ra_led_to_on      = 0;
+#endif
+
 /* Wii Starlet ARM can read PPC RAM directly: MEM1 at physical 0x00xxxxxx
  * and MEM2 at 0x10xxxxxx are mapped into Starlet's address space. The
  * ESP32 puts raw PPC physical offsets in the watchlist (0x008C2760 etc),
@@ -691,9 +743,25 @@ static u16 ra_led_celebrate = 0;
  * — no sync needed here. But a tight poll of a SINGLE address pins its
  * cache line and reads stale data for tens of ms; the VBI counter poll
  * needs os_sync_before_read before every read (see the VBI loop). */
+/* Conservative upper bound of the game's MEM2 arena. The IOS-reserved top of
+ * MEM2 (modules/heap/IPC, MLOAD lives at 0x13700000) starts well above any
+ * game's working set; a wild pointer landing there can fault the Starlet. The
+ * galaxy storm queries garbage like 0x13A1879B / 0x13F20475 (both >= this). */
+#define RA_MEM2_SAFE_HI  0x13800000u
+
 static u8 ra_read_ppc_byte(u32 addr)
 {
-	return *(volatile u8 *)addr;
+	/* Defensive: the ESP supplies addresses resolved from game pointer chains,
+	 * which during a galaxy load can be in-flux GARBAGE. Only deref known-mapped
+	 * game RAM (MEM1, all RAM; + the game's MEM2 region). A wild address outside
+	 * that range must NOT be dereferenced — an unmapped/protected addr would
+	 * data-abort the Starlet and hang IOS (the galaxy-freeze suspect). Return 0
+	 * so the chain just reads 0 (the do_frame gate handles the miss). */
+	if (addr <= 0x017FFFFFu)                              /* MEM1 (24MB, all RAM) */
+		return *(volatile u8 *)addr;
+	if (addr >= 0x10000000u && addr < RA_MEM2_SAFE_HI)    /* MEM2 game region */
+		return *(volatile u8 *)addr;
+	return 0;
 }
 
 /* Central response parser — called by BOTH ra_send_snapshot and
@@ -892,9 +960,15 @@ static s32 ra_send_snapshot(void)
 	                        + sizeof(ra_snapshot_header_t);
 	{   /* v0.28.9 — time reading the whole watchlist from PPC MEM1 */
 		u32 _m0 = vi_read_hw_timer();
+#if RA_READ_LED_DIAG
+		if (!ra_led_celebrate) Swi_LedOn();   /* LED ON = inside the snapshot PPC read loop */
+#endif
 		for (i = 0; i < count; i++) {
 			values[i] = ra_read_ppc_byte(ra_watchlist[i]);
 		}
+#if RA_READ_LED_DIAG
+		if (!ra_led_celebrate) Swi_LedOff();
+#endif
 		g_t_mem1_ms = vi_ticks_to_us(vi_read_hw_timer() - _m0) / 1000u;
 	}
 
@@ -941,9 +1015,20 @@ static s32 ra_send_addr_response(void)
 
 	values = ra_snap_tx_buf + sizeof(ra_gc_header_t)
 	                        + sizeof(ra_addr_response_t);
+#if RA_READ_LED_DIAG
+	/* Freeze forensics: disc-slot LED ON = we are INSIDE a PPC read loop. If the
+	 * galaxy freeze leaves the LED stuck ON, the Wii hung on ra_read_ppc_byte
+	 * (a MEM read stall during the load); stuck OFF = it hung elsewhere (parse /
+	 * EXI). 1 bit, but readable by eye at the freeze (no slow-mo). The WDOG-FREEZE
+	 * already pinned this to the ADDR_RESPONSE read vs parse window. */
+	if (!ra_led_celebrate) Swi_LedOn();
+#endif
 	for (i = 0; i < count; i++) {
 		values[i] = ra_read_ppc_byte(ra_pending_query_addrs[i]);
 	}
+#if RA_READ_LED_DIAG
+	if (!ra_led_celebrate) Swi_LedOff();
+#endif
 
 	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_addr_response_t) + count;
 	rx_len = sizeof(ra_snap_rx_buf);
@@ -1098,6 +1183,49 @@ static u32 ra_poll_thread(void *arg)
 			u32 now_tick, diff_us;
 			s32 fire_now = 0;
 
+#if RA_HEARTBEAT_LED
+			/* Freeze forensic: toggle the disc-slot LED every 250ms of wall time
+			 * AT THE TOP of the loop. Blinking at the freeze => the loop is still
+			 * cycling (Wii alive); frozen => a true hang inside a fire. */
+			{
+				static u32 hb_last = 0;
+				static u8  hb_on   = 0;
+				u32 hb_now = vi_read_hw_timer();
+				if (vi_ticks_to_us(hb_now - hb_last) >= 250000u) {
+					hb_last = hb_now;
+					hb_on   = !hb_on;
+					if (!ra_led_celebrate) {
+						if (hb_on) Swi_LedOn(); else Swi_LedOff();
+					}
+				}
+			}
+#endif
+
+#if RA_INT_TIMEOUT_LED
+			/* INT-timeout blip: solid LED for ~1s on any new exi_wait_int
+			 * timeout. Detection reads the lifetime timeout counters (bumped
+			 * inside ra_send_phase_b's WAIT phase); the off edge is wall-clock
+			 * so this runs at the top of EVERY iteration (incl. the no-fire
+			 * ra_sleep path) and never blocks. Back-to-back timeouts refresh
+			 * the deadline → sustained ON reads as "INT failing often".
+			 * Gated on !ra_led_celebrate so an unlock celebration wins the LED. */
+			{
+				u32 _to_total = g_to_phaseb + g_to_dbg;
+				u32 _to_tick  = vi_read_hw_timer();
+				if (_to_total != ra_led_to_seen) {
+					ra_led_to_seen    = _to_total;
+					ra_led_to_on      = 1;
+					ra_led_to_on_tick = _to_tick;
+					if (!ra_led_celebrate) Swi_LedOn();
+				}
+				if (ra_led_to_on &&
+				    vi_ticks_to_us(_to_tick - ra_led_to_on_tick) >= 1000000u) {
+					ra_led_to_on = 0;
+					if (!ra_led_celebrate) Swi_LedOff();
+				}
+			}
+#endif
+
 			os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
 			ctr = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
 			now_tick = vi_read_hw_timer();
@@ -1120,9 +1248,50 @@ static u32 ra_poll_thread(void *arg)
 			last_fire_tick = now_tick;
 			fires++;
 
-			(void)ra_send_snapshot();
-			for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
-				(void)ra_send_addr_response();
+			{
+#if RA_SPIKE_LOG
+				u32 _ap_t0 = vi_read_hw_timer();
+				u32 _pb0 = g_to_phaseb, _db0 = g_to_dbg;
+				u32 _maxw;
+#endif
+
+				(void)ra_send_snapshot();
+#if RA_SPIKE_LOG
+				_maxw = g_t_wait_ms;
+#endif
+				for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
+					(void)ra_send_addr_response();
+#if RA_SPIKE_LOG
+					if (g_t_wait_ms > _maxw) _maxw = g_t_wait_ms;
+#endif
+				}
+
+#if RA_SPIKE_LOG
+				/* Spike forensics: dump ONLY when this fire's convergence ran
+				 * long (event-triggered, unlike the periodic PHB that misses
+				 * spikes). ms=wall, r=addr-response rounds, w=longest single INT
+				 * wait, tb=Phase B INT-wait timeouts, td=debug-ACK timeouts. A
+				 * spike with small r but tb/td>0 (and w≈the 50ms cap) = the INT
+				 * timeout is the cost, NOT deep convergence. */
+				{
+					u32 _ap_us = vi_ticks_to_us(vi_read_hw_timer() - _ap_t0);
+					if (_ap_us > 30000u) {
+						u8 _sm[40]; u8 _so = 0;
+						_sm[_so++]='S';_sm[_so++]='P';_sm[_so++]='K';_sm[_so++]=' ';
+						_sm[_so++]='m';_sm[_so++]='s';_sm[_so++]='=';
+						_so += ra_dbg_u16_dec(_sm+_so,(u16)(_ap_us/1000u));
+						_sm[_so++]=' ';_sm[_so++]='r';_sm[_so++]='=';
+						_so += ra_dbg_u16_dec(_sm+_so,(u16)i);
+						_sm[_so++]=' ';_sm[_so++]='w';_sm[_so++]='=';
+						_so += ra_dbg_u16_dec(_sm+_so,(u16)_maxw);
+						_sm[_so++]=' ';_sm[_so++]='t';_sm[_so++]='b';_sm[_so++]='=';
+						_so += ra_dbg_u16_dec(_sm+_so,(u16)(g_to_phaseb-_pb0));
+						_sm[_so++]=' ';_sm[_so++]='t';_sm[_so++]='d';_sm[_so++]='=';
+						_so += ra_dbg_u16_dec(_sm+_so,(u16)(g_to_dbg-_db0));
+						ra_debug_send(_sm,_so);
+					}
+				}
+#endif
 			}
 
 			/* Achievement-unlock celebration on the disc-slot LED —
