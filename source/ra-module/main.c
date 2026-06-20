@@ -61,14 +61,16 @@
  * RA_READ_LED_DIAG (now OFF): LED ON while inside a ra_read_ppc_byte loop. Was the
  *   snapshot-freeze forensic (SOLID ON at the freeze = hung on a memory READ). The
  *   freeze it chased is resolved, so it's retired — kept guarded for revert.
- * RA_INT_TIMEOUT_LED (NOW ON): blip the disc-slot LED for ~1s on every new INT-wait
+ * RA_INT_TIMEOUT_LED (now OFF): blip the disc-slot LED for ~1s on every new INT-wait
  *   timeout (exi_wait_int hitting its RA_INT_TIMEOUT_MS=50ms cap, counted in
  *   g_to_phaseb / g_to_dbg). Lets us SEE how often the ESP→Wii INT line fails to
  *   assert in time, by eye, without a serial cable. Non-blocking: a wall-clock
  *   deadline stepped in the main loop drives the off edge — never a 1s busy-wait,
- *   which would starve other IOS threads. */
+ *   which would starve other IOS threads. Served its purpose (2026-06-20: most
+ *   blinks were the RA_SPIKE_LOG observer effect, not real losses; timeouts are
+ *   eval-spike-driven, see [[project_int_timeout_recovery]]) — retired, guarded. */
 #define RA_READ_LED_DIAG    0
-#define RA_INT_TIMEOUT_LED  1
+#define RA_INT_TIMEOUT_LED  0
 #define RA_HEARTBEAT_LED    0
 
 /* RA_SPIKE_LOG (default OFF): event-triggered "SPK ms=.. r=.. w=.. tb=.. td=.."
