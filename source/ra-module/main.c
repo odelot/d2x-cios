@@ -222,6 +222,26 @@ static void ra_log_hex(const char *label, u32 val)
 #define RA_EXI_DEV   EXI_DEVICE_0
 #define RA_EXI_FREQ  EXI_SPEED8MHZ
 
+/* Thread priorities. IOS convention: HIGHER number = HIGHER priority (same as
+ * Nintendont's kernel; MLOAD sits at 0x79 = top because it's the SWI dispatcher).
+ * The I/O drivers (DI/ES/FFS/USB/EHCI) sit at 0x48; FAT 0x62.
+ *
+ * FIELD-PROVEN CONSTRAINTS (2026-06-24):
+ *   1. IOS forbids os_thread_create() from spawning a CHILD with HIGHER priority
+ *      than the calling parent ("can lower, can't raise"). os_thread_create at
+ *      0x64 from a 0x48 main was REJECTED -> poll thread never ran.
+ *   2. Running the MAIN/IPC thread above 0x48 BREAKS boot: at 0x50 the IPC thread
+ *      preempts the I/O drivers, the VBI hook never engages, 0x2FF8 stays frozen
+ *      and the module is silent. The ra-module's IPC thread MUST stay at 0x48.
+ *
+ * So we use the Nintendont idiom: main is BORN high (start.s = RA_POLL_PRIORITY)
+ * purely so it can spawn the poll thread at that priority, then main LOWERS
+ * ITSELF to RA_MAIN_PRIORITY (0x48) before entering the IPC loop. Net result:
+ * poll thread runs at 0x50, IPC thread at 0x48. Keep RA_POLL_PRIORITY < MLOAD 0x79
+ * and start.s in sync with RA_POLL_PRIORITY. */
+#define RA_POLL_PRIORITY  0x50
+#define RA_MAIN_PRIORITY  0x48
+
 static u8  poll_thread_stack[4096] __attribute__((aligned(32)));
 static u32 esp_present = 0;   /* set after a successful IDENTIFY round-trip */
 
@@ -1537,12 +1557,14 @@ int main(void)
 	 * lighting up the LED, or if the thread is doing it. */
 	Swi_LedOff();
 
-	/* Inherit main thread priority instead of hardcoding 0x79. Same pattern
-	 * as fat-module/led.c — that module's LED blink thread runs at the
-	 * parent's priority so it always gets scheduled when main is blocked.
-	 * Our main runs at 0x48 (from start.s). Hardcoding 0x79 may have been
-	 * starving us. */
+	/* Poll-thread priority. main is born at RA_POLL_PRIORITY (start.s) ONLY so
+	 * it can spawn the poll thread that high — IOS won't let a child exceed its
+	 * parent. We default to RA_POLL_PRIORITY but fall back to inheriting if it
+	 * was left 0. */
 	priority = os_thread_get_priority(os_get_thread_id());
+#if RA_POLL_PRIORITY
+	priority = RA_POLL_PRIORITY;
+#endif
 
 	/* Create poll thread in paused state (autostart = 0). */
 	thread_id = os_thread_create(ra_poll_thread, NULL,
@@ -1554,6 +1576,13 @@ int main(void)
 	} else {
 		/* Create failed — leave LED OFF as our signal. */
 	}
+
+	/* Drop the MAIN/IPC thread back to the I/O-driver tier (0x48). Running the
+	 * IPC thread above 0x48 preempts DI/ES/FFS/USB during boot and freezes the
+	 * VBI hook (field-proven 2026-06-24). Lowering is always permitted; the poll
+	 * thread keeps the 0x50 it was created with. Do this BEFORE the IPC loop so
+	 * the high-priority window is just the spawn above. */
+	os_thread_set_priority(os_get_thread_id(), RA_MAIN_PRIORITY);
 
 	/* IPC Loop: Block forever on the queue waiting for open/close/ioctl requests. */
 	while (1) {
