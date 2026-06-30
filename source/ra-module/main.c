@@ -220,7 +220,19 @@ static void ra_log_hex(const char *label, u32 val)
  * Starlet-side direct register access from driving the bus. */
 #define RA_EXI_CHAN  EXI_CHAN_1
 #define RA_EXI_DEV   EXI_DEVICE_0
-#define RA_EXI_FREQ  EXI_SPEED8MHZ
+/* v0.33: 8->16MHz. The snapshot Phase-B round-trip is ~10ms/frame (PHB s=10), dominated
+ * by the EXI transfer of the ~1940-byte watchlist + response at 8MHz (wait/read are tiny).
+ * At 60Hz that eats 10 of the 16.6ms budget, so convergence rounds overrun the VBI edge ->
+ * the d2x misses edges -> fewer snapshots -> df/s<59 with debt=0. 16MHz ~halves the
+ * transfer slice of every snapshot AND every ADDR_RESPONSE round. The earlier 16MHz attempt
+ * "broke the boot" but that was actually the start.s 0x50 priority (now 0x48) + the
+ * time-based GET_CHUNK (now INT-handshake/Phase B, clock-independent) — both fixed, so the
+ * real EXI-clock A/B can finally run. Bad reads at higher freq degrade GRACEFULLY (magic
+ * mismatch -> retry, never corruption). If 16MHz is clean, try EXI_SPEED32MHZ. Revert to
+ * EXI_SPEED8MHZ if the memcard wiring can't hold the clock (symptom: bad-magic retries). */
+#define RA_EXI_FREQ  EXI_SPEED16MHZ   /* 32MHz HW-tested 2026-06-30: small txns OK but the
+                                       * SNAPSHOT transfer corrupts (bad mag=D7 flood) — the
+                                       * memcard wiring can't hold 32MHz. 16MHz is the ceiling. */
 
 /* Thread priorities. IOS convention: HIGHER number = HIGHER priority (same as
  * Nintendont's kernel; MLOAD sits at 0x79 = top because it's the SWI dispatcher).
@@ -239,7 +251,7 @@ static void ra_log_hex(const char *label, u32 val)
  * ITSELF to RA_MAIN_PRIORITY (0x48) before entering the IPC loop. Net result:
  * poll thread runs at 0x50, IPC thread at 0x48. Keep RA_POLL_PRIORITY < MLOAD 0x79
  * and start.s in sync with RA_POLL_PRIORITY. */
-#define RA_POLL_PRIORITY  0x50
+//#define RA_POLL_PRIORITY  0x50
 #define RA_MAIN_PRIORITY  0x48
 
 static u8  poll_thread_stack[4096] __attribute__((aligned(32)));
@@ -257,7 +269,7 @@ static u16 ra_watchlist_count = 0;
 
 /* Receive buffer sized for the maximum possible chunk response:
  *   ra_esp_header_t (6) + ra_watchlist_chunk_t (6) + 1024 addrs × 4 = 4108 */
-static u8  ra_chunk_rx_buf[6 + 6 + RA_WATCHLIST_CHUNK_ADDRS * 4]
+static u8  ra_chunk_rx_buf[6 + 6 + 6 + RA_WATCHLIST_CHUNK_ADDRS * 4]  /* +6 PAD for Phase B */
                           __attribute__((aligned(32)));
 
 static s32 ra_send(const void *tx, u32 tx_len, void *rx, u32 rx_len)
@@ -589,12 +601,18 @@ void ra_sleep_us(s32 time_us)
  *   negative on error
  * Side effect: appends fetched addresses to ra_watchlist[] / count.
  *
- * Two-transaction protocol due to ESP32's response timing: when we send
- * GET_CHUNK in transaction T1, ESP32 sees the request, processes it in its
- * main loop, and prepares the response for T2. T1's TX buffer holds the
- * PREVIOUS response (e.g. an IDENTIFY ack). So we always send the request
- * TWICE — the second send discards its own stale-response read and gets
- * the prepared chunk data. */
+ * INT handshake (Phase B), v0.33 — mirrors the Nintendont kernel fix
+ * (ra_module.c ra_fetch_watchlist_chunk). Replaces the legacy time-based
+ * two-transaction (T1 + ra_sleep(50) + T2 via plain ra_send), which guessed
+ * 50ms for the ESP to prep its tx_buf and desynced when the EXI clock changed.
+ * Write request -> wait for the ESP response-ready INT -> read the chunk.
+ *
+ * CRITICAL — the 6-byte PAD: the ESP prepends 6 bytes of 0xFF
+ * (GC_WRITE_PADDING) before the response. With the legacy 2-tx those were
+ * consumed by T2's WRITE phase, so the response started at read offset 0. In
+ * Phase B the write and read are SEPARATE CS-low ops, so the pad lands at the
+ * START of the read -> the real response begins at +PAD. (Confirmed on hw: the
+ * GET_CHUNK resp head is "FF FF FF FF FF FF AE 06 ...", magic AE at +6.) */
 static s32 ra_fetch_watchlist_chunk(u16 chunk_index)
 {
 	struct __attribute__((packed)) {
@@ -603,7 +621,7 @@ static s32 ra_fetch_watchlist_chunk(u16 chunk_index)
 	} tx;
 	ra_esp_header_t       resp;
 	ra_watchlist_chunk_t  chunk;
-	u8  discard[16];
+	const u32 PAD = sizeof(ra_gc_header_t) + sizeof(ra_watchlist_chunk_req_t); /* 6 */
 	u16 i;
 	s32 ret;
 
@@ -612,33 +630,21 @@ static s32 ra_fetch_watchlist_chunk(u16 chunk_index)
 	tx.hdr.payload_len = sizeof(ra_watchlist_chunk_req_t);
 	tx.req.chunk_index = chunk_index;
 
-	/* T1 — tell ESP32 to prepare chunk N. Read a small buffer (we don't
-	 * care about its content; it's the previous command's response). */
-	ret = ra_send(&tx, sizeof(tx), discard, sizeof(discard));
-	if (ret < 0) return ret;
-
-	/* Give ESP32 main loop a moment to process and prepare the response.
-	 * The 50ms sleep is conservative — ESP32 typically processes in a few
-	 * hundred µs once the SPI ISR signals — but extra padding here costs
-	 * nothing and avoids races. */
-	ra_sleep(50);
-
-	/* T2 — request the SAME chunk again, this time with the full receive
-	 * buffer. The TX buffer on ESP32 now holds the chunk response prepared
-	 * after T1. */
+	/* Single INT-gated round: write request -> wait for ESP INT -> read chunk.
+	 * The INT guarantees the chunk response is prepared before we read it. */
 	memset(ra_chunk_rx_buf, 0, sizeof(ra_chunk_rx_buf));
-	ret = ra_send(&tx, sizeof(tx), ra_chunk_rx_buf, sizeof(ra_chunk_rx_buf));
+	ret = ra_send_phase_b(&tx, sizeof(tx), ra_chunk_rx_buf, sizeof(ra_chunk_rx_buf));
 	if (ret < 0) return ret;
 
-	memcpy(&resp, ra_chunk_rx_buf, sizeof(resp));
+	memcpy(&resp, ra_chunk_rx_buf + PAD, sizeof(resp));
 	if (resp.magic != RA_MAGIC_ESP_TO_GC) return -100;
 
-	memcpy(&chunk, ra_chunk_rx_buf + sizeof(ra_esp_header_t), sizeof(chunk));
+	memcpy(&chunk, ra_chunk_rx_buf + PAD + sizeof(ra_esp_header_t), sizeof(chunk));
 	if (chunk.addr_count > RA_WATCHLIST_CHUNK_ADDRS) return -101;
 	if (chunk.chunk_index != chunk_index)            return -102;
 
 	{
-		const u8 *src = ra_chunk_rx_buf
+		const u8 *src = ra_chunk_rx_buf + PAD
 		              + sizeof(ra_esp_header_t)
 		              + sizeof(ra_watchlist_chunk_t);
 		for (i = 0; i < chunk.addr_count
@@ -1532,8 +1538,8 @@ int main(void)
 	svc_write("$IOSVersion: RA-HELLO3: " __DATE__ " " __TIME__ " $\n");
 
 	/* PROOF-OF-LIFE: turn the disc-slot LED ON before doing anything else.
-	 * If the LED lights up when a game boots through slot 247, we know:
-	 *   - The cIOS reloaded into slot 247
+	 * If the LED lights up when a game boots through the RA slot, we know:
+	 *   - The cIOS reloaded into the slot
 	 *   - ra-module's main() executed
 	 *   - MLOAD's SWI table is installed and Swi_LedOn() actually fires
 	 * If it doesn't light, the module isn't even being entered. */

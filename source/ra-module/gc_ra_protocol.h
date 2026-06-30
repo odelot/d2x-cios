@@ -113,6 +113,13 @@ typedef enum {
      * is fragile / impractical.
      */
     RA_CMD_DEBUG_LOG         = 0x09,
+
+    /**
+     * Wipe stored WiFi + RA credentials on the ESP32 and reboot it into the
+     * config portal. Sent by WiiFlow only (pre-boot); the ra-module never
+     * sees this command. Kept here only to keep the protocol enum in sync.
+     */
+    RA_CMD_RESET_CREDENTIALS = 0x0A,
 } ra_gc_command_t;
 
 /*
