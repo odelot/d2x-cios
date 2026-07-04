@@ -93,6 +93,15 @@
  * chasing a spike; leave OFF for normal play. */
 #define RA_SPIKE_LOG        0
 
+/* RA_DEBUG_SEND (default OFF): master gate for ra_debug_send, the EXI debug
+ * channel that the ESP forwards to serial as "DEBUG=GC: ...". Each send is
+ * NOT free — it blocks ra_sleep(10) + up to RA_INT_TIMEOUT_MS waiting for the
+ * ESP's debug-ACK INT, during which do_frame does not run. With this OFF the
+ * 5s VBI/PHB/OCAP diag burst (and the boot RX dumps) become no-ops, costing
+ * zero sleep/EXI on the in-game path. Turn ON only when actively reading the
+ * serial diag. */
+#define RA_DEBUG_SEND       0
+
 char *moduleName = "RA_MOD";
 
 /* ------------------------------------------------------------------------
@@ -338,6 +347,12 @@ u32 ra_dbg_u16_dec(u8 *dst, u16 v)
 
 void ra_debug_send(const u8 *msg, u8 msg_len)
 {
+#if !RA_DEBUG_SEND
+	/* Disabled: no EXI traffic, no ra_sleep, no INT wait. Zero cost on the
+	 * in-game path. See RA_DEBUG_SEND above. */
+	(void)msg; (void)msg_len;
+	return;
+#else
 	/* Largest packet: 4 hdr + 1 len + 255 msg = 260 bytes. */
 	static u8 buf[260] __attribute__((aligned(32)));
 	ra_gc_header_t *hdr = (ra_gc_header_t *)buf;
@@ -385,6 +400,7 @@ void ra_debug_send(const u8 *msg, u8 msg_len)
 	 * armed and ready. Timeout budget shared with Phase B. */
 	if (exi_wait_int(RA_EXI_CHAN, RA_INT_TIMEOUT_MS) < 0) g_to_dbg++;
 	exi_clear_int(RA_EXI_CHAN);
+#endif /* RA_DEBUG_SEND */
 }
 
 /* Phase B request/response pair, gated by ESP→Wii INT line (slot pin 2 →
