@@ -304,6 +304,29 @@ static u16 ra_chain_node_count = 0;
 static u16 ra_chain_shipped = 0;
 static u16 ra_chain_win_next = 0;                      /* rotating window cursor */
 
+/* Phase D: per-node frame history so dp edges (psize high bits) can read the
+ * parent's PREVIOUS-frame value (rcheevos DELTA) or last-DIFFERENT value
+ * (rcheevos PRIOR). Sound because the ESP's snapshot queue guarantees every
+ * walked frame is evaluated (walks == do_frames), so "previous walk" IS the
+ * evaluator's delta. Updated per node inside the walk (rcheevos update rule);
+ * dp edges are INVALID until the second walk (ra_chain_have_prev). The dp
+ * verification list is the distinct (parent,kind) pairs found scanning the
+ * table in order — the ESP derives the identical list from its own table. */
+static u32 ra_chain_values_prev[RA_MAX_CHAIN_NODES];   /* value at previous walk */
+static u32 ra_chain_prior[RA_MAX_CHAIN_NODES];         /* last DIFFERENT value */
+static u8  ra_chain_valid_prev[RA_MAX_CHAIN_NODES / 8];/* validity at previous walk —
+                                                        * ships as a bitmap after the
+                                                        * dp values so the ESP SKIPS
+                                                        * the compare for parents that
+                                                        * did not resolve (unloaded
+                                                        * pointers; safe: their whole
+                                                        * subtree evaluates as legacy
+                                                        * zeros anyway) */
+static u8  ra_chain_have_prev = 0;
+static u16 ra_chain_dp_node[RA_MAX_DP_PARENTS];        /* dp parent node index */
+static u8  ra_chain_dp_kind[RA_MAX_DP_PARENTS];        /* RA_CN_DP_DELTA/PRIOR */
+static u16 ra_chain_dp_count = 0;
+
 static s32 ra_send(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 {
 	return exi_transaction(RA_EXI_CHAN, RA_EXI_DEV, RA_EXI_FREQ,
@@ -772,23 +795,43 @@ static int ra_chain_addr_ok(u32 addr, u8 w)
 
 /* Walk the whole table in slot order (parents always precede children).
  * Fills ra_chain_values[] + ra_chain_node_valid[]. Children of an invalid
- * node are invalid without reading. */
+ * node are invalid without reading.
+ *
+ * Phase D: an edge whose psize dp-kind != CUR reads the parent's
+ * values_prev (DELTA) or prior (PRIOR) instead of values — the parent was
+ * processed EARLIER this walk, so its values_prev already means "value at
+ * walk N-1". History updates follow the rcheevos rule per node: prev = old,
+ * prior = old only when the value changed. dp edges are invalid until the
+ * second walk (no history yet); an out-of-range address computed from a
+ * garbage prev is caught by the range check like any other. */
 static void ra_chain_walk(void)
 {
 	u16 i;
 
+	/* Snapshot last walk's validity BEFORE overwriting — pairs with the
+	 * values_prev the dp section ships (both describe walk N-1). */
+	memcpy(ra_chain_valid_prev, ra_chain_node_valid, sizeof(ra_chain_valid_prev));
+
 	for (i = 0; i < ra_chain_node_count; i++) {
 		const ra_chain_node_t *n = &ra_chain_nodes[i];
 		u8  op    = n->op & 0x1F;
+		u8  dpk   = (u8)(n->psize >> RA_CN_PSZ_DP_SHIFT);
 		u8  valid = 1;
 		u32 pv    = 0;
 		u32 v     = 0;
+		u32 old;
 
 		if (n->parent != RA_CHAIN_PARENT_NONE) {
 			if (!(ra_chain_node_valid[n->parent >> 3] & (1u << (n->parent & 7))))
 				valid = 0;
-			else
-				pv = ra_chain_xform(ra_chain_values[n->parent], n->psize);
+			else if (dpk != RA_CN_DP_CUR && !ra_chain_have_prev)
+				valid = 0;   /* no history yet — dp edge unresolvable */
+			else {
+				u32 praw = (dpk == RA_CN_DP_DELTA) ? ra_chain_values_prev[n->parent]
+				         : (dpk == RA_CN_DP_PRIOR) ? ra_chain_prior[n->parent]
+				         :                           ra_chain_values[n->parent];
+				pv = ra_chain_xform(praw, (u8)(n->psize & RA_CN_PSZ_MEM_MASK));
+			}
 		}
 
 		if (op == RA_CN_OP_NONE) {
@@ -812,12 +855,19 @@ static void ra_chain_walk(void)
 				v = ra_chain_combine(pv, n->operand, op);
 		}
 
+		/* Frame history (Phase D): rcheevos update rule. */
+		old = ra_chain_values[i];
+		ra_chain_values_prev[i] = old;
+		if (v != old)
+			ra_chain_prior[i] = old;
+
 		ra_chain_values[i] = v;
 		if (valid)
 			ra_chain_node_valid[i >> 3] |=  (u8)(1u << (i & 7));
 		else
 			ra_chain_node_valid[i >> 3] &= (u8)~(1u << (i & 7));
 	}
+	ra_chain_have_prev = 1;
 }
 
 /* Fetch one chain-table chunk. Same Phase B + PAD=6 pattern as
@@ -907,13 +957,49 @@ static void ra_fetch_chain_table(void)
 			ra_chain_ship_node[ra_chain_shipped++] = i;
 	}
 
+	/* Phase D: reset per-node history + build the dp verification list —
+	 * distinct (parent,kind) pairs in table-scan order (the ESP derives the
+	 * identical list from its copy of the table). Emitter caps the count at
+	 * RA_MAX_DP_PARENTS; overflow here means a corrupt table -> reject. */
+	ra_chain_have_prev = 0;
+	ra_chain_dp_count  = 0;
+	for (i = 0; i < ra_chain_node_count; i++) {
+		ra_chain_values[i]      = 0;
+		ra_chain_values_prev[i] = 0;
+		ra_chain_prior[i]       = 0;
+	}
+	memset(ra_chain_valid_prev, 0, sizeof(ra_chain_valid_prev));
+	for (i = 0; i < ra_chain_node_count; i++) {
+		const ra_chain_node_t *n = &ra_chain_nodes[i];
+		u8 dpk = (u8)(n->psize >> RA_CN_PSZ_DP_SHIFT);
+		u16 j;
+		if (dpk == RA_CN_DP_CUR || n->parent == RA_CHAIN_PARENT_NONE)
+			continue;
+		for (j = 0; j < ra_chain_dp_count; j++)
+			if (ra_chain_dp_node[j] == n->parent && ra_chain_dp_kind[j] == dpk)
+				break;
+		if (j < ra_chain_dp_count)
+			continue;
+		if (ra_chain_dp_count >= RA_MAX_DP_PARENTS) {
+			ra_chain_node_count = 0;   /* corrupt table — Phase C off */
+			ra_chain_shipped    = 0;
+			ra_chain_dp_count   = 0;
+			return;
+		}
+		ra_chain_dp_node[ra_chain_dp_count] = n->parent;
+		ra_chain_dp_kind[ra_chain_dp_count] = dpk;
+		ra_chain_dp_count++;
+	}
+
 	{
-		u8 m[32];
+		u8 m[40];
 		u32 o = 0;
 		m[o++]='C';m[o++]='H';m[o++]='N';m[o++]=' ';m[o++]='n';m[o++]='=';
 		o += ra_dbg_u16_dec(m + o, ra_chain_node_count);
 		m[o++]=' ';m[o++]='s';m[o++]='h';m[o++]='=';
 		o += ra_dbg_u16_dec(m + o, ra_chain_shipped);
+		m[o++]=' ';m[o++]='d';m[o++]='p';m[o++]='=';
+		o += ra_dbg_u16_dec(m + o, ra_chain_dp_count);
 		ra_debug_send(m, (u8)o);
 	}
 }
@@ -1275,10 +1361,14 @@ static s32 ra_send_snapshot(void)
 
 	/* Phase C chain window — greedy fill from the rotating cursor until the
 	 * 8192B transaction budget is hit; next frame resumes where we stopped
-	 * (wraps to 0 at the end). Bitmap bit i = window slot i valid. */
+	 * (wraps to 0 at the end). Bitmap bit i = window slot i valid.
+	 * Phase D: the dp verification section (4B per dp entry) is reserved
+	 * OFF THE TOP so the window can never squeeze it out. */
 	if (ra_chain_node_count > 0 && ra_chain_shipped > 0) {
 		u32 avail = sizeof(ra_snap_tx_buf) - sizeof(ra_gc_header_t)
-		          - sizeof(ra_snapshot_header_t) - count;
+		          - sizeof(ra_snapshot_header_t) - count
+		          - (u32)ra_chain_dp_count * 4u
+		          - ((u32)ra_chain_dp_count + 7u) / 8u;  /* dp validity bitmap */
 		u16 s = (ra_chain_win_next < ra_chain_shipped) ? ra_chain_win_next : 0;
 
 		win_first = s;
@@ -1317,11 +1407,39 @@ static s32 ra_send_snapshot(void)
 	snap->chain_first    = win_first;
 	snap->chain_count    = win_count;
 	snap->chain_blob_len = (u16)blob_len;
+	snap->dp_count       = ra_chain_dp_count;
+
+	/* Phase D dp verification section — the prev/prior parent values the
+	 * walker used THIS frame (list order fixed at fetch; the ESP compares
+	 * against its own memref delta/prior after its upd and defers on
+	 * mismatch). Written after the window blob. */
+	if (ra_chain_dp_count > 0) {
+		u8 *dp = values + count + bm_bytes + blob_len;
+		u8 *dpv = dp + (u32)ra_chain_dp_count * 4u;   /* validity bitmap */
+		u32 dpv_bytes = ((u32)ra_chain_dp_count + 7u) / 8u;
+		u16 di;
+		for (di = 0; di < dpv_bytes; di++)
+			dpv[di] = 0;
+		for (di = 0; di < ra_chain_dp_count; di++) {
+			u16 node = ra_chain_dp_node[di];
+			u32 dv = (ra_chain_dp_kind[di] == RA_CN_DP_PRIOR)
+			         ? ra_chain_prior[node]
+			         : ra_chain_values_prev[node];
+			memcpy(dp + (u32)di * 4u, &dv, 4);   /* Starlet is BE = wire order */
+			/* validity of the shipped value = the parent RESOLVED at walk
+			 * N-1 (values_prev meaningful). ESP skips the compare on 0. */
+			if (ra_chain_valid_prev[node >> 3] & (1u << (node & 7)))
+				dpv[di >> 3] |= (u8)(1u << (di & 7));
+		}
+	}
 
 	hdr->payload_len = (u16)(sizeof(ra_snapshot_header_t) + count
-	                         + bm_bytes + blob_len);
+	                         + bm_bytes + blob_len
+	                         + (u32)ra_chain_dp_count * 4u
+	                         + ((u32)ra_chain_dp_count + 7u) / 8u);
 	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count
-	       + bm_bytes + blob_len;
+	       + bm_bytes + blob_len + (u32)ra_chain_dp_count * 4u
+	       + ((u32)ra_chain_dp_count + 7u) / 8u;
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
