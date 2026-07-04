@@ -52,6 +52,17 @@
  * grow into it, and the booter zeroes it at boot via the codelist memset. */
 #define RA_VBI_COUNTER_PHYS  0x00002FF8u
 
+/* On-screen trophy overlay (matches RA_TROPHY_OVERLAY in WiiFlow's
+ * source/loader/fst.c). When enabled, an achievement unlock writes a 1/0
+ * "draw this frame" flag to physical MEM1 0x2FFC; the extended C0 VBlank
+ * hook on the PPC reads it (uncached 0xC0002FFC) and paints a yellow
+ * rectangle in the top-right of the active XFB, blinking 3x in lockstep
+ * with the disc-slot LED. Sits in the same reserved codelist tail as the
+ * frame counter (0x2FF8). Safe to leave on even if WiiFlow ships the
+ * counter-only hook — the flag is simply never read. */
+#define RA_TROPHY_OVERLAY    1
+#define RA_TROPHY_FLAG_PHYS  0x00002FFCu
+
 /* Galaxy-freeze forensics (2026-06-18).
  * RA_HEARTBEAT_LED RESULT: at the galaxy freeze the LED STOPPED blinking = the
  *   main loop is NOT cycling = a TRUE Starlet hang inside a fire (not alive-loop).
@@ -723,6 +734,17 @@ static u16 ra_resync_seq = 0;
  * main loop — never sleeps, so the snapshot cadence is untouched. */
 static u16 ra_led_celebrate = 0;
 
+#if RA_TROPHY_OVERLAY
+/* Trophy-flag diagnostic latch (2026-06-22). The flag write to PPC MEM1
+ * 0x2FFC never showed the overlay though the LED blinked; these record the
+ * last write/read-back so the reliable 5s diag can report "TRO n=.. w=.. rb=.."
+ * (a burst of ra_debug_send during the 0.9s celebration was unreliable).
+ * n>0 after an unlock proves the celebration code ran (build is fresh). */
+static u32 g_tro_writes = 0;
+static u32 g_tro_last_w = 0;
+static u32 g_tro_last_rb = 0;
+#endif
+
 /* INT-timeout diagnostic blink state (RA_INT_TIMEOUT_LED). ra_led_to_seen
  * tracks the last-observed lifetime INT-timeout total (g_to_phaseb +
  * g_to_dbg); when it grows, the disc-slot LED lights and ra_led_to_on_tick
@@ -1308,6 +1330,31 @@ static u32 ra_poll_thread(void *arg)
 					else
 						Swi_LedOff();
 				}
+#if RA_TROPHY_OVERLAY
+				/* Mirror the LED phase to the PPC trophy flag EVERY frame
+				 * (robustness — a single lost write no longer blanks a whole
+				 * 9-frame window). on = current LED phase = ((cel+8)/9)&1.
+				 * os_sync_after_write flushes the Starlet D-cache so the PPC's
+				 * uncached read at 0xC0002FFC sees it.
+				 *
+				 * DIAG (2026-06-22): the trophy never appeared on hw though the
+				 * LED blinked — Starlet->MEM1 writes are unproven (we only ever
+				 * READ PPC RAM). At each LED boundary, read the flag back (with
+				 * invalidate) and log "TRO w=.. rb=..": rb==w => the write
+				 * reached Starlet DRAM (so it's a cross-CPU coherency issue);
+				 * rb!=w => the low-MEM1 write itself isn't sticking. */
+				{
+					u32 on = ((u32)(ra_led_celebrate + 8) / 9) & 1;
+					*(volatile u32 *)RA_TROPHY_FLAG_PHYS = on;
+					os_sync_after_write((void *)RA_TROPHY_FLAG_PHYS, 4);
+					/* Latch write + immediate read-back (Starlet side) for the
+					 * 5s diag — no ra_debug_send here (would stall the burst). */
+					os_sync_before_read((void *)RA_TROPHY_FLAG_PHYS, 4);
+					g_tro_last_rb = *(volatile u32 *)RA_TROPHY_FLAG_PHYS;
+					g_tro_last_w  = on;
+					g_tro_writes++;
+				}
+#endif
 			}
 
 			/* Phase D2 in-game RESYNC — re-fetch the full watchlist via
@@ -1356,6 +1403,23 @@ static u32 ra_poll_thread(void *arg)
 				m[o++] = ' '; m[o++] = 's'; m[o++] = '=';
 				o += ra_dbg_u16_dec(m + o, (u16)g_t_snap_ms);
 				ra_debug_send(m, (u8)o);
+
+#if RA_TROPHY_OVERLAY
+				/* Trophy-flag diag. n = flag writes since boot (n>0 means an
+				 * unlock celebration ran → the build is fresh). w/rb = last
+				 * value written / Starlet read-back. rb==w => the write reached
+				 * Starlet DRAM (cross-CPU issue then); rb!=w => the MEM1 write
+				 * itself isn't sticking. */
+				o = 0;
+				m[o++] = 'T'; m[o++] = 'R'; m[o++] = 'O'; m[o++] = ' ';
+				m[o++] = 'n'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)g_tro_writes);
+				m[o++] = ' '; m[o++] = 'w'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)g_tro_last_w);
+				m[o++] = ' '; m[o++] = 'r'; m[o++] = 'b'; m[o++] = '=';
+				o += ra_dbg_u16_dec(m + o, (u16)g_tro_last_rb);
+				ra_debug_send(m, (u8)o);
+#endif
 
 				/* OCAP: live peeks at the Ocarina chain landmarks. Unlike
 				 * the one-shot OCA dump above (which runs BEFORE the booter's
