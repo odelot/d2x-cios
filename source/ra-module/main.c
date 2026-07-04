@@ -277,9 +277,32 @@ static u32 ra_watchlist[RA_MAX_WATCH_ADDRS] __attribute__((aligned(32)));
 static u16 ra_watchlist_count = 0;
 
 /* Receive buffer sized for the maximum possible chunk response:
- *   ra_esp_header_t (6) + ra_watchlist_chunk_t (6) + 1024 addrs × 4 = 4108 */
-static u8  ra_chunk_rx_buf[6 + 6 + 6 + RA_WATCHLIST_CHUNK_ADDRS * 4]  /* +6 PAD for Phase B */
+ *   watchlist: esp hdr (6) + ra_watchlist_chunk_t (6) + 1024 addrs × 4 = 4108
+ *   chain:     esp hdr (6) + ra_chain_chunk_t (8) + 512 nodes × 8    = 4110 */
+static u8  ra_chunk_rx_buf[6 + 6 + 8 + RA_WATCHLIST_CHUNK_ADDRS * 4]  /* +6 PAD for Phase B */
                           __attribute__((aligned(32)));
+
+/* ------------------------------------------------------------------------
+ * Phase C chain descriptor table + per-frame walk state. Fetched once per
+ * game via RA_CMD_GET_CHAIN_CHUNK (after the watchlist); node semantics in
+ * gc_ra_protocol.h. node_count==0 => Phase C off (pure legacy).
+ * ------------------------------------------------------------------------ */
+#define RA_CHAIN_PARENT_NONE  0xFFFF
+
+typedef struct __attribute__((packed)) {
+	u32 operand;   /* const offset/mask/immediate, or root absolute addr */
+	u16 parent;    /* earlier node index, or RA_CHAIN_PARENT_NONE */
+	u8  op;        /* bits 0-4 RA_CN_OP_*, bits 5-6 width-1, bit 7 shipped */
+	u8  psize;     /* RA_CN_SZ_* transform applied to the parent value */
+} ra_chain_node_t;
+
+static ra_chain_node_t ra_chain_nodes[RA_MAX_CHAIN_NODES] __attribute__((aligned(32)));
+static u32 ra_chain_values[RA_MAX_CHAIN_NODES];        /* LE-pack raw per node */
+static u16 ra_chain_ship_node[RA_MAX_CHAIN_NODES];     /* shipped idx -> node idx */
+static u8  ra_chain_node_valid[RA_MAX_CHAIN_NODES / 8];/* bitmap per NODE */
+static u16 ra_chain_node_count = 0;
+static u16 ra_chain_shipped = 0;
+static u16 ra_chain_win_next = 0;                      /* rotating window cursor */
 
 static s32 ra_send(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 {
@@ -693,6 +716,209 @@ static s32 ra_fetch_watchlist(void)
 }
 
 /* ------------------------------------------------------------------------
+ * Phase C — chain table fetch + per-frame walker.
+ *
+ * Semantics mirror the ESP resolver EXACTLY (spec in gc_ra_protocol.h):
+ * deref node value = LE-pack of raw bytes (b0 = lowest address = bits 0-7);
+ * the edge transform (psize) masks/byteswaps the PARENT's value; combines
+ * are u32 ALU. All helpers are if/else chains, NOT switch — gcc can lower
+ * a dense switch to a .rodata jump table and .rodata IS NOT LOADED in this
+ * module ([[project-ra-module-rodata-not-loaded]]).
+ * ------------------------------------------------------------------------ */
+
+static u8 ra_read_ppc_byte(u32 addr);   /* defined below (snapshot section) */
+
+static u32 ra_chain_xform(u32 v, u8 psize)
+{
+	if (psize == RA_CN_SZ_32)    return v;
+	if (psize == RA_CN_SZ_32_BE) return ((v & 0xFF000000u) >> 24) |
+	                                    ((v & 0x00FF0000u) >>  8) |
+	                                    ((v & 0x0000FF00u) <<  8) |
+	                                    ((v & 0x000000FFu) << 24);
+	if (psize == RA_CN_SZ_8)     return v & 0x000000FFu;
+	if (psize == RA_CN_SZ_16)    return v & 0x0000FFFFu;
+	if (psize == RA_CN_SZ_24)    return v & 0x00FFFFFFu;
+	if (psize == RA_CN_SZ_16_BE) return ((v & 0xFF00u) >> 8) | ((v & 0x00FFu) << 8);
+	if (psize == RA_CN_SZ_24_BE) return ((v & 0xFF0000u) >> 16) | (v & 0x00FF00u) |
+	                                    ((v & 0x0000FFu) << 16);
+	return v;
+}
+
+static u32 ra_chain_combine(u32 pv, u32 o, u8 op)
+{
+	if (op == RA_CN_OP_AND)        return pv & o;
+	if (op == RA_CN_OP_ADD)        return pv + o;
+	if (op == RA_CN_OP_SUB)        return pv - o;
+	if (op == RA_CN_OP_MULT)       return pv * o;
+	if (op == RA_CN_OP_DIV)        return o ? pv / o : 0;
+	if (op == RA_CN_OP_XOR)        return pv ^ o;
+	if (op == RA_CN_OP_MOD)        return o ? pv % o : 0;
+	if (op == RA_CN_OP_SUB_PARENT) return o - pv;
+	if (op == RA_CN_OP_ADD_ACC)    return pv + o;
+	if (op == RA_CN_OP_SUB_ACC)    return pv - o;
+	return 0;
+}
+
+/* Same MEM1/MEM2 guard as the ESP collect: a wild deref can hang the
+ * Starlet thread (SVC data abort — [[project_vi_probe_crashed_kernel]]). */
+static int ra_chain_addr_ok(u32 addr, u8 w)
+{
+	u32 end = addr + (u32)w - 1u;
+	if (end < addr) return 0;                                 /* wrap */
+	if (end <= 0x017FFFFFu) return 1;                         /* MEM1 */
+	if (addr >= 0x10000000u && end <= 0x137FFFFFu) return 1;  /* MEM2 (IOS top excl.) */
+	return 0;
+}
+
+/* Walk the whole table in slot order (parents always precede children).
+ * Fills ra_chain_values[] + ra_chain_node_valid[]. Children of an invalid
+ * node are invalid without reading. */
+static void ra_chain_walk(void)
+{
+	u16 i;
+
+	for (i = 0; i < ra_chain_node_count; i++) {
+		const ra_chain_node_t *n = &ra_chain_nodes[i];
+		u8  op    = n->op & 0x1F;
+		u8  valid = 1;
+		u32 pv    = 0;
+		u32 v     = 0;
+
+		if (n->parent != RA_CHAIN_PARENT_NONE) {
+			if (!(ra_chain_node_valid[n->parent >> 3] & (1u << (n->parent & 7))))
+				valid = 0;
+			else
+				pv = ra_chain_xform(ra_chain_values[n->parent], n->psize);
+		}
+
+		if (op == RA_CN_OP_NONE) {
+			v = n->operand;
+		}
+		else if (op == RA_CN_OP_DEREF) {
+			u32 addr = (n->parent == RA_CHAIN_PARENT_NONE) ? n->operand
+			                                               : (pv + n->operand);
+			u8 w = (u8)(((n->op >> 5) & 3) + 1);
+			if (valid && ra_chain_addr_ok(addr, w)) {
+				u8 k;
+				for (k = 0; k < w; k++)
+					v |= (u32)ra_read_ppc_byte(addr + k) << (8u * k);
+			} else {
+				valid = 0;
+				v = 0;
+			}
+		}
+		else {
+			if (valid)
+				v = ra_chain_combine(pv, n->operand, op);
+		}
+
+		ra_chain_values[i] = v;
+		if (valid)
+			ra_chain_node_valid[i >> 3] |=  (u8)(1u << (i & 7));
+		else
+			ra_chain_node_valid[i >> 3] &= (u8)~(1u << (i & 7));
+	}
+}
+
+/* Fetch one chain-table chunk. Same Phase B + PAD=6 pattern as
+ * ra_fetch_watchlist_chunk. *base = nodes accumulated so far. Returns 1 on
+ * is_last, 0 for more, negative on error. */
+static s32 ra_fetch_chain_chunk(u16 chunk_index, u16 *base)
+{
+	struct __attribute__((packed)) {
+		ra_gc_header_t        hdr;
+		ra_chain_chunk_req_t  req;
+	} tx;
+	ra_esp_header_t   resp;
+	ra_chain_chunk_t  chunk;
+	const u32 PAD = sizeof(ra_gc_header_t) + sizeof(ra_chain_chunk_req_t); /* 6 */
+	u16 i;
+	s32 ret;
+
+	tx.hdr.magic       = RA_MAGIC_GC_TO_ESP;
+	tx.hdr.command     = RA_CMD_GET_CHAIN_CHUNK;
+	tx.hdr.payload_len = sizeof(ra_chain_chunk_req_t);
+	tx.req.chunk_index = chunk_index;
+
+	memset(ra_chunk_rx_buf, 0, sizeof(ra_chunk_rx_buf));
+	ret = ra_send_phase_b(&tx, sizeof(tx), ra_chunk_rx_buf, sizeof(ra_chunk_rx_buf));
+	if (ret < 0) return ret;
+
+	memcpy(&resp, ra_chunk_rx_buf + PAD, sizeof(resp));
+	if (resp.magic != RA_MAGIC_ESP_TO_GC) return -100;
+
+	memcpy(&chunk, ra_chunk_rx_buf + PAD + sizeof(ra_esp_header_t), sizeof(chunk));
+	if (chunk.node_count > RA_CHAIN_CHUNK_NODES)          return -101;
+	if (chunk.chunk_index != chunk_index)                 return -102;
+	if (chunk.total_nodes > RA_MAX_CHAIN_NODES)           return -103;
+	if ((u32)*base + chunk.node_count > chunk.total_nodes) return -104;
+
+	memcpy(&ra_chain_nodes[*base],
+	       ra_chunk_rx_buf + PAD + sizeof(ra_esp_header_t) + sizeof(ra_chain_chunk_t),
+	       (u32)chunk.node_count * RA_CHAIN_NODE_SIZE);
+
+	/* Structural validation: parents must reference EARLIER slots (the
+	 * walker is a single forward pass) and ops must be known. A violation
+	 * poisons the whole table -> caller disables Phase C. */
+	for (i = 0; i < chunk.node_count; i++) {
+		const ra_chain_node_t *n = &ra_chain_nodes[*base + i];
+		u8 op = n->op & 0x1F;
+		if (n->parent != RA_CHAIN_PARENT_NONE && n->parent >= (u16)(*base + i))
+			return -105;
+		if (op != RA_CN_OP_NONE && op != RA_CN_OP_DEREF &&
+		    (op < RA_CN_OP_MULT || op > RA_CN_OP_SUB_ACC))
+			return -106;
+	}
+
+	*base = (u16)(*base + chunk.node_count);
+	return chunk.is_last ? 1 : 0;
+}
+
+/* Fetch the whole chain table. Any failure => Phase C off (legacy-only);
+ * an ESP without a table answers node_count=0/is_last=1 on chunk 0. */
+static void ra_fetch_chain_table(void)
+{
+	u16 base = 0;
+	u16 chunk_idx = 0;
+	u16 i;
+	s32 ret;
+
+	ra_chain_node_count = 0;
+	ra_chain_shipped    = 0;
+	ra_chain_win_next   = 0;
+
+	while (chunk_idx < (RA_MAX_CHAIN_NODES / RA_CHAIN_CHUNK_NODES) + 1) {
+		ret = ra_fetch_chain_chunk(chunk_idx, &base);
+		if (ret < 0) {
+			u8 m[24];
+			u32 o = 0;
+			m[o++]='C';m[o++]='H';m[o++]='N';m[o++]=' ';m[o++]='e';m[o++]='r';m[o++]='r';m[o++]='=';
+			o += ra_dbg_u16_dec(m + o, (u16)(-ret));
+			ra_debug_send(m, (u8)o);
+			return;   /* legacy-only */
+		}
+		if (ret == 1) break;
+		chunk_idx++;
+	}
+
+	ra_chain_node_count = base;
+	for (i = 0; i < ra_chain_node_count; i++) {
+		if (ra_chain_nodes[i].op & 0x80)
+			ra_chain_ship_node[ra_chain_shipped++] = i;
+	}
+
+	{
+		u8 m[32];
+		u32 o = 0;
+		m[o++]='C';m[o++]='H';m[o++]='N';m[o++]=' ';m[o++]='n';m[o++]='=';
+		o += ra_dbg_u16_dec(m + o, ra_chain_node_count);
+		m[o++]=' ';m[o++]='s';m[o++]='h';m[o++]='=';
+		o += ra_dbg_u16_dec(m + o, ra_chain_shipped);
+		ra_debug_send(m, (u8)o);
+	}
+}
+
+/* ------------------------------------------------------------------------
  * SNAPSHOT / ADDR_RESPONSE state machine — reconstruction 2026-06-01.
  *
  * The previous full-featured main.c (with these functions) was overwritten
@@ -733,8 +959,11 @@ static u16 ra_pending_query_count = 0;
  * (header + max watchlist values) and reused for ADDR_RESPONSE writes.
  * Goes out via exi_batch_write (kernel-batched immediate chunks — no
  * alignment/length constraints; the 32B alignment + headroom are
- * leftovers from the abandoned EXI-DMA attempt, kept as harmless). */
-static u8 ra_snap_tx_buf[16 + RA_MAX_WATCH_ADDRS + 32] __attribute__((aligned(32)));
+ * leftovers from the abandoned EXI-DMA attempt, kept as harmless).
+ * Phase C: sized to the full 8192B EXI transaction so the snapshot can
+ * carry flat values + the chain window (bitmap + blob); the window
+ * budget in ra_send_snapshot is derived from sizeof() this buffer. */
+static u8 ra_snap_tx_buf[8192] __attribute__((aligned(32)));
 
 /* RX buffer — sized to hold the ESP32's longest response. Since v0.28.7
  * (RA_ADDR_QUERY_MAX=512) that is an ADDR_QUERY or WATCHLIST_APPEND:
@@ -1002,10 +1231,12 @@ static s32 ra_send_snapshot(void)
 	u16 i;
 	u8 *values;
 
+	u16 win_first = 0, win_count = 0;
+	u32 blob_len = 0, bm_bytes = 0;
+
 	hdr = (ra_gc_header_t *)ra_snap_tx_buf;
 	hdr->magic       = RA_MAGIC_GC_TO_ESP;
 	hdr->command     = RA_CMD_SNAPSHOT;
-	hdr->payload_len = sizeof(ra_snapshot_header_t) + count;
 
 	snap = (ra_snapshot_header_t *)(ra_snap_tx_buf + sizeof(ra_gc_header_t));
 	/* v0.26.1: frame_counter carries the PPC VBI counter (TRUE game
@@ -1024,7 +1255,9 @@ static s32 ra_send_snapshot(void)
 
 	values = ra_snap_tx_buf + sizeof(ra_gc_header_t)
 	                        + sizeof(ra_snapshot_header_t);
-	{   /* v0.28.9 — time reading the whole watchlist from PPC MEM1 */
+	{   /* v0.28.9 — time reading the whole watchlist from PPC MEM1.
+	     * Phase C: the chain walk reads MEM1 too, so it lives inside the
+	     * same timing block (visible as m= in the PHB diag). */
 		u32 _m0 = vi_read_hw_timer();
 #if RA_READ_LED_DIAG
 		if (!ra_led_celebrate) Swi_LedOn();   /* LED ON = inside the snapshot PPC read loop */
@@ -1032,13 +1265,63 @@ static s32 ra_send_snapshot(void)
 		for (i = 0; i < count; i++) {
 			values[i] = ra_read_ppc_byte(ra_watchlist[i]);
 		}
+		if (ra_chain_node_count > 0)
+			ra_chain_walk();
 #if RA_READ_LED_DIAG
 		if (!ra_led_celebrate) Swi_LedOff();
 #endif
 		g_t_mem1_ms = vi_ticks_to_us(vi_read_hw_timer() - _m0) / 1000u;
 	}
 
-	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count;
+	/* Phase C chain window — greedy fill from the rotating cursor until the
+	 * 8192B transaction budget is hit; next frame resumes where we stopped
+	 * (wraps to 0 at the end). Bitmap bit i = window slot i valid. */
+	if (ra_chain_node_count > 0 && ra_chain_shipped > 0) {
+		u32 avail = sizeof(ra_snap_tx_buf) - sizeof(ra_gc_header_t)
+		          - sizeof(ra_snapshot_header_t) - count;
+		u16 s = (ra_chain_win_next < ra_chain_shipped) ? ra_chain_win_next : 0;
+
+		win_first = s;
+		while (s < ra_chain_shipped) {
+			const ra_chain_node_t *n = &ra_chain_nodes[ra_chain_ship_node[s]];
+			u8  w  = (u8)(((n->op >> 5) & 3) + 1);
+			u32 nb = (((u32)win_count + 1u) + 7u) / 8u;
+			if (nb + blob_len + w > avail) break;
+			blob_len += w;
+			win_count++;
+			s++;
+		}
+		bm_bytes = ((u32)win_count + 7u) / 8u;
+		ra_chain_win_next = (s >= ra_chain_shipped) ? 0 : s;
+
+		{
+			u8 *bm   = values + count;
+			u8 *blob = bm + bm_bytes;
+			u16 wi;
+			for (wi = 0; wi < bm_bytes; wi++)
+				bm[wi] = 0;
+			for (wi = 0; wi < win_count; wi++) {
+				u16 node = ra_chain_ship_node[win_first + wi];
+				const ra_chain_node_t *n = &ra_chain_nodes[node];
+				u8  w = (u8)(((n->op >> 5) & 3) + 1);
+				u32 v = ra_chain_values[node];
+				u8  k;
+				if (ra_chain_node_valid[node >> 3] & (1u << (node & 7)))
+					bm[wi >> 3] |= (u8)(1u << (wi & 7));
+				for (k = 0; k < w; k++)
+					blob[k] = (u8)(v >> (8u * k));
+				blob += w;
+			}
+		}
+	}
+	snap->chain_first    = win_first;
+	snap->chain_count    = win_count;
+	snap->chain_blob_len = (u16)blob_len;
+
+	hdr->payload_len = (u16)(sizeof(ra_snapshot_header_t) + count
+	                         + bm_bytes + blob_len);
+	tx_len = sizeof(ra_gc_header_t) + sizeof(ra_snapshot_header_t) + count
+	       + bm_bytes + blob_len;
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
@@ -1190,6 +1473,11 @@ static u32 ra_poll_thread(void *arg)
 			Swi_LedOff(); ra_sleep(80);
 			Swi_LedOn();  ra_sleep(80);
 			Swi_LedOff();
+
+			/* Phase C: pull the chain descriptor table (once per game).
+			 * Any failure or an empty table just leaves Phase C off —
+			 * the legacy ADDR_QUERY path is unaffected. */
+			ra_fetch_chain_table();
 		}
 	}
 
