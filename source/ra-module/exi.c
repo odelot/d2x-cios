@@ -3,7 +3,7 @@
  * known to drive USB Gecko on slot B (channel 1) from Starlet. We use the
  * SAME register-access pattern (inline-asm ldr/str via Write32/Read32),
  * the SAME approach of overwriting CSR completely (not read-modify-write),
- * and the SAME CR bit layout. Differences: we target channel 0 (slot A,
+ * and the SAME CR bit layout. Differences: we target channel 1 (slot B,
  * where the ESP32 lives), with our own freq + data length.
  */
 
