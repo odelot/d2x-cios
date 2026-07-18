@@ -51,7 +51,7 @@
 			<content id="0x27" module="ES" tmdmoduleid="-1"/>
 			<content id="0x28" module="FFSP" tmdmoduleid="-1"/>
 		</base>
-		<base ios="38" version="4123" contentscount="21" modulescount="6">
+		<base ios="38" version="4123" contentscount="22" modulescount="7">
 			<content id="0x15" patchscount="7">
 				<!-- cIOS signature fields -->
 				<patch offset="0x00" size="4"  originalbytes="0x66,0x69,0x72,0x6d" newbytes="0x1e,0xe7,0xc1,0x05"/>
@@ -96,6 +96,7 @@
 			<content id="0x1b" module="DIPP" tmdmoduleid="-1"/>
 			<content id="0x1c" module="ES" tmdmoduleid="-1"/>
 			<content id="0x1d" module="FFSP" tmdmoduleid="-1"/>
+			<content id="0x1e" module="RAMOD" tmdmoduleid="-1"/>
 		</base>
 		<base ios="53" version="5662" contentscount="21" modulescount="6">
 			<content id="0x19" patchscount="7">
@@ -248,7 +249,7 @@
 			<content id="0x1e" module="FFSP" tmdmoduleid="-1"/>
 			<content id="0x1f" module="RAMOD" tmdmoduleid="-1"/>
 		</base>
-		<base ios="57" version="5918" contentscount="25" modulescount="6">
+		<base ios="57" version="5918" contentscount="26" modulescount="7">
 			<content id="0x18" patchscount="7">
 				<patch offset="0x00" size="4"  originalbytes="0x66,0x69,0x72,0x6d" newbytes="0x1e,0xe7,0xc1,0x05"/>
 				<patch offset="0x04" size="4"  originalbytes="0x77,0x61,0x72,0x65" newbytes="0x00,0x00,0x00,0x01"/>
@@ -300,6 +301,7 @@
 			<content id="0x20" module="DIPP" tmdmoduleid="-1"/>
 			<content id="0x21" module="ES" tmdmoduleid="-1"/>
 			<content id="0x22" module="FFSP" tmdmoduleid="-1"/>
+			<content id="0x23" module="RAMOD" tmdmoduleid="-1"/>
 		</base>
 		<base ios="58" version="6175" contentscount="26" modulescount="7">
 			<content id="0x13" patchscount="7">

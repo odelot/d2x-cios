@@ -258,11 +258,20 @@ typedef enum {
     RA_STATUS_LOADING_GAME   = 0x05,
     RA_STATUS_GAME_LOADED    = 0x06,
     RA_STATUS_ACTIVE         = 0x07,  /* Fully operational, processing frames */
-    RA_STATUS_ERROR_WIFI     = 0xE0,
-    RA_STATUS_ERROR_LOGIN    = 0xE1,
-    RA_STATUS_ERROR_GAME     = 0xE2,
+    /* Adapter has no stored WiFi/RA credentials and is serving its captive
+     * config portal (WII_RA_ADAPTER AP). Non-terminal from the adapter's
+     * point of view, but a frontend should tell the user to configure it. */
+    RA_STATUS_PORTAL         = 0x08,
+    RA_STATUS_ERROR_WIFI     = 0xE0,  /* no WiFi link / no internet (RC_NO_RESPONSE) */
+    RA_STATUS_ERROR_LOGIN    = 0xE1,  /* RA rejected the credentials / token expired */
+    RA_STATUS_ERROR_GAME     = 0xE2,  /* game load failed (server/API error) */
     RA_STATUS_ERROR_PROTOCOL = 0xE3,
+    /* Hash not in the RA database — likely a bad dump / unsupported image. */
+    RA_STATUS_ERROR_UNKNOWN_GAME = 0xE4,
 } ra_status_t;
+
+/** First status value that means "terminal failure". */
+#define RA_STATUS_IS_ERROR(s)  ((uint8_t)(s) >= 0xE0)
 
 /*
  * ============================================================================
@@ -365,6 +374,16 @@ typedef struct __attribute__((packed)) {
 
 /**
  * RA_CMD_GET_WATCHLIST_CHUNK response header
+ *
+ * CRC32 TRAILER (ESP fw v0.35.2+): both chunked responses (watchlist and
+ * chain) append a CRC32 — poly 0xEDB88320, reflected, init/final 0xFFFFFFFF
+ * — big-endian AFTER the payload, covering [ra_esp_header_t .. payload end].
+ * esp_header.data_len does NOT include it. Backward compatible: consumers
+ * that don't read the trailer simply never clock those 4 bytes; consumers
+ * that verify it (d2x 2026-07-18+) REQUIRE ESP fw v0.35.2+ or every fetch
+ * fails CRC. Rationale: the 4KB chunk reads are the longest EXI transfers
+ * and field-corrupted once (CHN err=106); the CRC turns silent tail
+ * corruption into a retryable error.
  */
 typedef struct __attribute__((packed)) {
     uint16_t chunk_index;
@@ -520,7 +539,9 @@ typedef struct __attribute__((packed)) {
 } ra_chain_chunk_req_t;
 
 /** RA_CMD_GET_CHAIN_CHUNK response header, followed by node_count nodes.
- *  node_count == 0 on chunk 0 => no table for this game (Phase C off). */
+ *  node_count == 0 on chunk 0 => no table for this game (Phase C off).
+ *  ESP fw v0.35.2+ appends a CRC32 trailer after the nodes — see
+ *  ra_watchlist_chunk_t above for the exact spec. */
 typedef struct __attribute__((packed)) {
     uint16_t chunk_index;    /* echoes the requested index */
     uint16_t node_count;     /* nodes in THIS chunk */
