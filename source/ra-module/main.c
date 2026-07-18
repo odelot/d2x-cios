@@ -278,8 +278,9 @@ static u16 ra_watchlist_count = 0;
 
 /* Receive buffer sized for the maximum possible chunk response:
  *   watchlist: esp hdr (6) + ra_watchlist_chunk_t (6) + 1024 addrs × 4 = 4108
- *   chain:     esp hdr (6) + ra_chain_chunk_t (8) + 512 nodes × 8    = 4110 */
-static u8  ra_chunk_rx_buf[6 + 6 + 8 + RA_WATCHLIST_CHUNK_ADDRS * 4]  /* +6 PAD for Phase B */
+ *   chain:     esp hdr (6) + ra_chain_chunk_t (8) + 512 nodes × 8    = 4110
+ * +6 PAD for Phase B, +4 for the CRC32 trailer (ESP fw v0.35.2+). */
+static u8  ra_chunk_rx_buf[6 + 6 + 8 + RA_WATCHLIST_CHUNK_ADDRS * 4 + 4]
                           __attribute__((aligned(32)));
 
 /* ------------------------------------------------------------------------
@@ -391,14 +392,13 @@ u32 ra_dbg_u16_dec(u8 *dst, u16 v)
 	return o;
 }
 
-void ra_debug_send(const u8 *msg, u8 msg_len)
+/* The real sender — ALWAYS compiled, independent of RA_DEBUG_SEND. Chatty
+ * periodic diagnostics go through the gated ra_debug_send below; FAILURE-path
+ * messages (chain/watchlist fetch aborts, CRC mismatches) call this directly
+ * so field errors stay visible in release builds. The cost (ra_sleep(10) +
+ * one EXI write + INT wait) is only paid when something already went wrong. */
+void ra_debug_send_always(const u8 *msg, u8 msg_len)
 {
-#if !RA_DEBUG_SEND
-	/* Disabled: no EXI traffic, no ra_sleep, no INT wait. Zero cost on the
-	 * in-game path. See RA_DEBUG_SEND above. */
-	(void)msg; (void)msg_len;
-	return;
-#else
 	/* Largest packet: 4 hdr + 1 len + 255 msg = 260 bytes. */
 	static u8 buf[260] __attribute__((aligned(32)));
 	ra_gc_header_t *hdr = (ra_gc_header_t *)buf;
@@ -446,7 +446,54 @@ void ra_debug_send(const u8 *msg, u8 msg_len)
 	 * armed and ready. Timeout budget shared with Phase B. */
 	if (exi_wait_int(RA_EXI_CHAN, RA_INT_TIMEOUT_MS) < 0) g_to_dbg++;
 	exi_clear_int(RA_EXI_CHAN);
+}
+
+void ra_debug_send(const u8 *msg, u8 msg_len)
+{
+#if !RA_DEBUG_SEND
+	/* Disabled: no EXI traffic, no ra_sleep, no INT wait. Zero cost on the
+	 * in-game path. See RA_DEBUG_SEND above. */
+	(void)msg; (void)msg_len;
+#else
+	ra_debug_send_always(msg, msg_len);
 #endif /* RA_DEBUG_SEND */
+}
+
+/* Bitwise CRC32 (poly 0xEDB88320, reflected, init/final 0xFFFFFFFF). NO
+ * lookup table on purpose — .rodata is not loaded in this module
+ * ([[project-ra-module-rodata-not-loaded]]). ~0.7ms for a 4KB chunk on the
+ * ARM926, paid once per game load (+ rare RESYNCs). Must match the ESP's
+ * ra_crc32_calc byte for byte. */
+static u32 ra_crc32(const u8 *p, u32 len)
+{
+	u32 crc = 0xFFFFFFFFu;
+	u32 i, b;
+	for (i = 0; i < len; i++) {
+		crc ^= p[i];
+		for (b = 0; b < 8; b++)
+			crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+	}
+	return ~crc;
+}
+
+/* Chunk fetches (watchlist + chain) retry on ANY per-chunk failure: the
+ * 4KB EXI reads are the longest transfers in the system and wire corruption
+ * there was observed in the field (2026-07-18, CHN err=106 — a corrupted
+ * node op byte). The CRC32 trailer turns any corruption into a clean
+ * retryable error instead of a poisoned table / silent bad watchlist. */
+#define RA_CHUNK_FETCH_ATTEMPTS  3
+
+/* Report a chunk fetch that only succeeded after retries — a live field
+ * signal of marginal EXI signal integrity. tag: 'W' watchlist, 'C' chain. */
+static void ra_report_chunk_retry(u8 tag, u16 idx, u16 att)
+{
+	u8 m[24];
+	u32 o = 0;
+	m[o++]='R';m[o++]='T';m[o++]='Y';m[o++]=' ';m[o++]=tag;m[o++]=' ';m[o++]='i';m[o++]='=';
+	o += ra_dbg_u16_dec(m + o, idx);
+	m[o++]=' ';m[o++]='a';m[o++]='=';
+	o += ra_dbg_u16_dec(m + o, att);
+	ra_debug_send_always(m, (u8)o);
 }
 
 /* Phase B request/response pair, gated by ESP→Wii INT line (slot pin 2 →
@@ -675,7 +722,7 @@ void ra_sleep_us(s32 time_us)
  * Phase B the write and read are SEPARATE CS-low ops, so the pad lands at the
  * START of the read -> the real response begins at +PAD. (Confirmed on hw: the
  * GET_CHUNK resp head is "FF FF FF FF FF FF AE 06 ...", magic AE at +6.) */
-static s32 ra_fetch_watchlist_chunk(u16 chunk_index)
+static s32 ra_fetch_watchlist_chunk_once(u16 chunk_index)
 {
 	struct __attribute__((packed)) {
 		ra_gc_header_t            hdr;
@@ -705,6 +752,19 @@ static s32 ra_fetch_watchlist_chunk(u16 chunk_index)
 	if (chunk.addr_count > RA_WATCHLIST_CHUNK_ADDRS) return -101;
 	if (chunk.chunk_index != chunk_index)            return -102;
 
+	/* CRC32 trailer (ESP fw v0.35.2+): guards the whole payload. The addr
+	 * tail has no structural validation, so wire corruption there would
+	 * poison the watchlist SILENTLY without this. Checked before the append
+	 * loop — a failed attempt leaves ra_watchlist untouched for the retry. */
+	{
+		u32 want, got;
+		const u32 pl = sizeof(ra_esp_header_t) + sizeof(ra_watchlist_chunk_t)
+		             + (u32)chunk.addr_count * 4u;
+		memcpy(&got, ra_chunk_rx_buf + PAD + pl, sizeof(got));
+		want = ra_crc32(ra_chunk_rx_buf + PAD, pl);
+		if (got != want) return -103;
+	}
+
 	{
 		const u8 *src = ra_chunk_rx_buf + PAD
 		              + sizeof(ra_esp_header_t)
@@ -720,6 +780,23 @@ static s32 ra_fetch_watchlist_chunk(u16 chunk_index)
 	return chunk.is_last ? 1 : 0;
 }
 
+/* Retry wrapper — see RA_CHUNK_FETCH_ATTEMPTS. A failed attempt mutates no
+ * state (the CRC check precedes the append loop), so re-requesting the same
+ * chunk is stateless on both sides. */
+static s32 ra_fetch_watchlist_chunk(u16 chunk_index)
+{
+	s32 ret = -1;
+	u16 att;
+	for (att = 0; att < RA_CHUNK_FETCH_ATTEMPTS; att++) {
+		ret = ra_fetch_watchlist_chunk_once(chunk_index);
+		if (ret >= 0) {
+			if (att) ra_report_chunk_retry('W', chunk_index, att);
+			return ret;
+		}
+	}
+	return ret;
+}
+
 /* Fetch all chunks until is_last. Returns 0 on success, negative on error. */
 static s32 ra_fetch_watchlist(void)
 {
@@ -731,7 +808,15 @@ static s32 ra_fetch_watchlist(void)
 	/* Sanity cap: 32 chunks × 1024 addrs = 32k addrs (way over max). */
 	while (chunk_idx < 32) {
 		ret = ra_fetch_watchlist_chunk(chunk_idx);
-		if (ret < 0) return ret;
+		if (ret < 0) {
+			/* Failure-path diag — visible in release builds. */
+			u8 m[16];
+			u32 o = 0;
+			m[o++]='W';m[o++]='L';m[o++]='C';m[o++]=' ';m[o++]='e';m[o++]='r';m[o++]='r';m[o++]='=';
+			o += ra_dbg_u16_dec(m + o, (u16)(-ret));
+			ra_debug_send_always(m, (u8)o);
+			return ret;
+		}
 		if (ret == 1) return 0;  /* is_last */
 		chunk_idx++;
 	}
@@ -870,6 +955,21 @@ static void ra_chain_walk(void)
 	ra_chain_have_prev = 1;
 }
 
+/* DIAG 2026-07-18 (CHN err=106 hunt): report the exact node the validator
+ * rejected — global index + the 8 raw bytes as received over EXI. Cross-
+ * check against the ESP's SERVE-side log of the same index to split
+ * emitter bug / ESP RAM corruption / wire corruption. */
+static void ra_chain_dump_bad_node(u16 idx, const ra_chain_node_t *n)
+{
+	u8 m[40];
+	u32 o = 0;
+	m[o++]='C';m[o++]='H';m[o++]='N';m[o++]=' ';m[o++]='i';m[o++]='=';
+	o += ra_dbg_u16_dec(m + o, idx);
+	m[o++]=' ';m[o++]='b';m[o++]='=';
+	o += ra_dbg_hex_bytes(m + o, (const u8 *)n, 8, 0);
+	ra_debug_send_always(m, (u8)o);
+}
+
 /* Fetch one chain-table chunk. Same Phase B + PAD=6 pattern as
  * ra_fetch_watchlist_chunk. *base = nodes accumulated so far. Returns 1 on
  * is_last, 0 for more, negative on error. */
@@ -903,6 +1003,19 @@ static s32 ra_fetch_chain_chunk(u16 chunk_index, u16 *base)
 	if (chunk.total_nodes > RA_MAX_CHAIN_NODES)           return -103;
 	if ((u32)*base + chunk.node_count > chunk.total_nodes) return -104;
 
+	/* CRC32 trailer (ESP fw v0.35.2+) — checked BEFORE the node memcpy so
+	 * corrupted bytes never reach ra_chain_nodes. The 2026-07-18 field
+	 * failure (CHN err=106, corrupted op byte on this exact 4116B read)
+	 * becomes a clean -107 + retry instead of Phase C silently off. */
+	{
+		u32 want, got;
+		const u32 pl = sizeof(ra_esp_header_t) + sizeof(ra_chain_chunk_t)
+		             + (u32)chunk.node_count * RA_CHAIN_NODE_SIZE;
+		memcpy(&got, ra_chunk_rx_buf + PAD + pl, sizeof(got));
+		want = ra_crc32(ra_chunk_rx_buf + PAD, pl);
+		if (got != want) return -107;
+	}
+
 	memcpy(&ra_chain_nodes[*base],
 	       ra_chunk_rx_buf + PAD + sizeof(ra_esp_header_t) + sizeof(ra_chain_chunk_t),
 	       (u32)chunk.node_count * RA_CHAIN_NODE_SIZE);
@@ -913,11 +1026,15 @@ static s32 ra_fetch_chain_chunk(u16 chunk_index, u16 *base)
 	for (i = 0; i < chunk.node_count; i++) {
 		const ra_chain_node_t *n = &ra_chain_nodes[*base + i];
 		u8 op = n->op & 0x1F;
-		if (n->parent != RA_CHAIN_PARENT_NONE && n->parent >= (u16)(*base + i))
+		if (n->parent != RA_CHAIN_PARENT_NONE && n->parent >= (u16)(*base + i)) {
+			ra_chain_dump_bad_node((u16)(*base + i), n);
 			return -105;
+		}
 		if (op != RA_CN_OP_NONE && op != RA_CN_OP_DEREF &&
-		    (op < RA_CN_OP_MULT || op > RA_CN_OP_SUB_ACC))
+		    (op < RA_CN_OP_MULT || op > RA_CN_OP_SUB_ACC)) {
+			ra_chain_dump_bad_node((u16)(*base + i), n);
 			return -106;
+		}
 	}
 
 	*base = (u16)(*base + chunk.node_count);
@@ -938,13 +1055,23 @@ static void ra_fetch_chain_table(void)
 	ra_chain_win_next   = 0;
 
 	while (chunk_idx < (RA_MAX_CHAIN_NODES / RA_CHAIN_CHUNK_NODES) + 1) {
-		ret = ra_fetch_chain_chunk(chunk_idx, &base);
+		/* Retry per chunk — a failed attempt never advances `base`, so
+		 * re-requesting the same index is stateless on both sides. */
+		u16 att;
+		ret = -1;
+		for (att = 0; att < RA_CHUNK_FETCH_ATTEMPTS; att++) {
+			ret = ra_fetch_chain_chunk(chunk_idx, &base);
+			if (ret >= 0) {
+				if (att) ra_report_chunk_retry('C', chunk_idx, att);
+				break;
+			}
+		}
 		if (ret < 0) {
 			u8 m[24];
 			u32 o = 0;
 			m[o++]='C';m[o++]='H';m[o++]='N';m[o++]=' ';m[o++]='e';m[o++]='r';m[o++]='r';m[o++]='=';
 			o += ra_dbg_u16_dec(m + o, (u16)(-ret));
-			ra_debug_send(m, (u8)o);
+			ra_debug_send_always(m, (u8)o);
 			return;   /* legacy-only */
 		}
 		if (ret == 1) break;
