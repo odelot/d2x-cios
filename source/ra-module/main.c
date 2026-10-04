@@ -80,6 +80,10 @@
  *   which would starve other IOS threads. Served its purpose (2026-06-20: most
  *   blinks were the RA_SPIKE_LOG observer effect, not real losses; timeouts are
  *   eval-spike-driven, see [[project_int_timeout_recovery]]) — retired, guarded. */
+/* 2026-09-25: re-enabled for the MKW race-start freeze together with the
+ * RA_MEM2_SAFE_HI tightening; 2026-09-26: the guard FIXED it (8 races, zero
+ * freezes) -> back OFF (it cost two LED SWIs per snapshot). Flip to 1 again if
+ * a new console freeze needs the read-vs-elsewhere split. */
 #define RA_READ_LED_DIAG    0
 #define RA_INT_TIMEOUT_LED  0
 #define RA_HEARTBEAT_LED    0
@@ -867,14 +871,28 @@ static u32 ra_chain_combine(u32 pv, u32 o, u8 op)
 	return 0;
 }
 
+/* Upper bound (exclusive) of the MEM2 the GAME can own — shared by both read
+ * guards (ra_chain_addr_ok for the Phase C walk, ra_read_ppc_byte for the flat
+ * watchlist / ADDR_QUERY reads).
+ * 2026-09-25: 0x13800000 -> 0x13400000. The PPC's addressable MEM2 ends at
+ * 0x93400000 (OS global 0x80003120; usable arena ends 0x933E0000, the IOS IPC
+ * buffer runs up to 0x93400000). Everything from physical 0x13400000 up is
+ * IOS-private (heap, modules, MLOAD 0x13700000, this module 0x136dc000), so no
+ * game pointer can legitimately point there — only a pointer caught mid-update
+ * can. The old 0x13800000 still let such garbage deref 4MB of IOS memory from
+ * this USER-mode thread. Field: MKW froze IOS (Wiimote + power dead, PPC
+ * still rendering, SNAPs stop with no ADDR_QUERY before) at every race start,
+ * with both the full and the trimmed set — load-independent, like a fault. */
+#define RA_MEM2_SAFE_HI  0x13400000u
+
 /* Same MEM1/MEM2 guard as the ESP collect: a wild deref can hang the
  * Starlet thread (SVC data abort — [[project_vi_probe_crashed_kernel]]). */
 static int ra_chain_addr_ok(u32 addr, u8 w)
 {
 	u32 end = addr + (u32)w - 1u;
-	if (end < addr) return 0;                                 /* wrap */
-	if (end <= 0x017FFFFFu) return 1;                         /* MEM1 */
-	if (addr >= 0x10000000u && end <= 0x137FFFFFu) return 1;  /* MEM2 (IOS top excl.) */
+	if (end < addr) return 0;                                    /* wrap */
+	if (end <= 0x017FFFFFu) return 1;                            /* MEM1 */
+	if (addr >= 0x10000000u && end < RA_MEM2_SAFE_HI) return 1;  /* MEM2 game region */
 	return 0;
 }
 
@@ -1251,11 +1269,9 @@ static u8  ra_led_to_on      = 0;
  * — no sync needed here. But a tight poll of a SINGLE address pins its
  * cache line and reads stale data for tens of ms; the VBI counter poll
  * needs os_sync_before_read before every read (see the VBI loop). */
-/* Conservative upper bound of the game's MEM2 arena. The IOS-reserved top of
- * MEM2 (modules/heap/IPC, MLOAD lives at 0x13700000) starts well above any
- * game's working set; a wild pointer landing there can fault the Starlet. The
- * galaxy storm queries garbage like 0x13A1879B / 0x13F20475 (both >= this). */
-#define RA_MEM2_SAFE_HI  0x13800000u
+/* RA_MEM2_SAFE_HI (defined above ra_chain_addr_ok): upper bound of the game's
+ * MEM2. The galaxy storm queried garbage like 0x13A1879B / 0x13F20475; MKW's
+ * race-start freeze moved the bound down to the PPC-addressable end. */
 
 static u8 ra_read_ppc_byte(u32 addr)
 {
