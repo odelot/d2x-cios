@@ -19,6 +19,21 @@
 #include "vi.h"
 #include "led.h"
 #include "gc_ra_protocol.h"
+#include "ra_build.h"
+#include "usb_link.h"
+
+/* With RA_BUILD_USB_PROBE set, RAMOD is the USB spike (usbprobe.c) and none
+ * of the RA module below is compiled. */
+#if !RA_BUILD_USB_PROBE
+
+#if RA_LINK_USB
+/* USB builds skip the SADDR strip, so string literals are real here and
+ * svc_write would send actual text to MLOAD's USB Gecko driver on Slot B,
+ * whose send loop can spin with a card in the slot (Wii USB spike rounds
+ * 4-8: the game never booted with the adapter in Slot B). The EXI build only
+ * ever sent zeroed (empty) strings. Keep it that way. */
+#define svc_write(s)  ((void)0)
+#endif
 
 /* Scheduling: PPC VBI sync (the only mode since v0.27.0 — the HW_TIMER
  * pacer and the fixed-16ms builds were retired after the VBI lock was
@@ -332,10 +347,21 @@ static u16 ra_chain_dp_node[RA_MAX_DP_PARENTS];        /* dp parent node index *
 static u8  ra_chain_dp_kind[RA_MAX_DP_PARENTS];        /* RA_CN_DP_DELTA/PRIOR */
 static u16 ra_chain_dp_count = 0;
 
+/* USB: how long a blocking exchange may take before it is left in flight
+ * (the next exchange resumes it). The chunk replies are ~4 KB = ~5 ms of
+ * wire; the rest is the ESP's processing. */
+#define RA_USB_XFER_TIMEOUT_MS  100u
+
 static s32 ra_send(const void *tx, u32 tx_len, void *rx, u32 rx_len)
 {
+#if RA_LINK_USB
+	/* EXI single-CS transaction: the read phase starts after the tx_len
+	 * bytes the write phase already clocked out — skip them in the reply. */
+	return ra_usb_xfer(tx, tx_len, rx, rx_len, tx_len, RA_USB_XFER_TIMEOUT_MS);
+#else
 	return exi_transaction(RA_EXI_CHAN, RA_EXI_DEV, RA_EXI_FREQ,
 	                       tx, tx_len, rx, rx_len);
+#endif
 }
 
 /* ---------- Debug log channel ----------
@@ -419,6 +445,14 @@ void ra_debug_send_always(const u8 *msg, u8 msg_len)
 
 	total = sizeof(ra_gc_header_t) + 1 + msg_len;
 
+#if RA_LINK_USB
+	/* USB: the ESP answers every request (the ACK is read and dropped), so
+	 * the request/reply alternation needs no settle sleep or INT wait. */
+	if (ra_usb_xfer(buf, total, NULL, 0, 0, RA_INT_TIMEOUT_MS) < 0)
+		g_to_dbg++;
+	return;
+#endif
+
 	/* Guard against ESP still processing the previous Phase B read: give the
 	 * main loop a chance to call exi_spi_arm. 10ms is generous. */
 	ra_sleep(10);
@@ -444,7 +478,7 @@ void ra_debug_send_always(const u8 *msg, u8 msg_len)
 	 * dropped → ra-module's subsequent read returns all 0xFF (idle MISO).
 	 * Verified in the v0.19.1 + debug-no-sync log: every debug_send was
 	 * followed by an all-FF response on the next round (lines 117/118 of
-	 * wii.log timestamp 00:20:15).
+	 * that wii.log).
 	 *
 	 * We don't bother reading the ACK; we just need to know the ESP is
 	 * armed and ready. Timeout budget shared with Phase B. */
@@ -525,6 +559,19 @@ volatile u32 g_t_snap_ms = 0;
 static s32 ra_send_phase_b(void *tx, u32 tx_len, void *rx, u32 rx_len)
 {
 	s32 ret;
+
+#if RA_LINK_USB
+	/* USB: request, then the reply from its first byte (no INT, no pads to
+	 * re-arm around). Same timeout semantics as the INT wait. */
+	{
+		u32 _wt0 = vi_read_hw_timer();
+		ret = ra_usb_xfer(tx, tx_len, rx, rx_len, 0, RA_INT_TIMEOUT_MS);
+		g_t_wait_ms = vi_ticks_to_us(vi_read_hw_timer() - _wt0) / 1000u;
+	}
+	if (ret < 0)
+		g_to_phaseb++;
+	return ret;
+#endif
 
 	/* Pre-clear any stale EXI_IRQ latch. The ESP firmware sets
 	 * g_response_prepared=true on every prepare_response, which triggers
@@ -1153,7 +1200,7 @@ static void ra_fetch_chain_table(void)
  * SNAPSHOT / ADDR_RESPONSE state machine — reconstruction 2026-06-01.
  *
  * The previous full-featured main.c (with these functions) was overwritten
- * after building ra-module.elf.orig (May 31 10:20). This reconstruction
+ * after building ra-module.elf.orig (May 31). This reconstruction
  * follows the protocol semantics defined in gc_ra_protocol.h, mirrors the
  * GameCube ra_agent.c (swiss-gc) pattern, and applies every fix the bug
  * archaeology documented:
@@ -1194,7 +1241,16 @@ static u16 ra_pending_query_count = 0;
  * Phase C: sized to the full 8192B EXI transaction so the snapshot can
  * carry flat values + the chain window (bitmap + blob); the window
  * budget in ra_send_snapshot is derived from sizeof() this buffer. */
+#if RA_LINK_USB
+/* USB: the OHCI crosses only one 4 KB page boundary per transfer, so a full
+ * 8 KB request needs a page-aligned buffer — and one byte short of 8192
+ * (RA_USB_TX_MAX), since an 8192-byte message would get a framing pad. */
+static u8 ra_snap_tx_buf[8192] __attribute__((aligned(4096)));
+#define RA_SNAP_TX_BUDGET  RA_USB_TX_MAX
+#else
 static u8 ra_snap_tx_buf[8192] __attribute__((aligned(32)));
+#define RA_SNAP_TX_BUDGET  sizeof(ra_snap_tx_buf)
+#endif
 
 /* RX buffer — sized to hold the ESP32's longest response. Since v0.28.7
  * (RA_ADDR_QUERY_MAX=512) that is an ADDR_QUERY or WATCHLIST_APPEND:
@@ -1508,7 +1564,7 @@ static s32 ra_send_snapshot(void)
 	 * Phase D: the dp verification section (4B per dp entry) is reserved
 	 * OFF THE TOP so the window can never squeeze it out. */
 	if (ra_chain_node_count > 0 && ra_chain_shipped > 0) {
-		u32 avail = sizeof(ra_snap_tx_buf) - sizeof(ra_gc_header_t)
+		u32 avail = RA_SNAP_TX_BUDGET - sizeof(ra_gc_header_t)
 		          - sizeof(ra_snapshot_header_t) - count
 		          - (u32)ra_chain_dp_count * 4u
 		          - ((u32)ra_chain_dp_count + 7u) / 8u;  /* dp validity bitmap */
@@ -1586,6 +1642,19 @@ static s32 ra_send_snapshot(void)
 	rx_len = sizeof(ra_snap_rx_buf);
 	memset(ra_snap_rx_buf, 0, rx_len);
 
+#if RA_LINK_USB && RA_USB_PIPELINE
+	/* Pipelined: put the exchange on the wire and return. The reply lands in
+	 * ra_snap_rx_buf while the game runs and ra_snap_collect parses it at the
+	 * next fire — the same order the ESP sees with EXI (snapshot N, its
+	 * reply, any ADDR_RESPONSE rounds, snapshot N+1). */
+	{
+		u32 _s0 = vi_read_hw_timer();
+		ret = ra_usb_post(ra_snap_tx_buf, tx_len, ra_snap_rx_buf, rx_len);
+		g_t_snap_ms = vi_ticks_to_us(vi_read_hw_timer() - _s0) / 1000u;
+	}
+	if (ret < 0) g_to_phaseb++;
+	return ret;
+#else
 	{   /* v0.28.9 — time the Phase-B round-trip (write + wait + read). Cycle
 	     * budget ≈ g_t_mem1_ms + g_t_snap_ms; wait is the slice inside it. */
 		u32 _s0 = vi_read_hw_timer();
@@ -1596,7 +1665,32 @@ static s32 ra_send_snapshot(void)
 
 	ra_parse_response(ra_snap_rx_buf);
 	return 0;
+#endif
 }
+
+#if RA_LINK_USB && RA_USB_PIPELINE
+/* Collect the reply to the snapshot posted at the previous fire and parse it
+ * (events, ADDR_QUERY, WATCHLIST mutations...) before anything else this
+ * fire touches the link. Normally already there (the spike's reply-wait was
+ * 15-20 us); waits up to the EXI INT budget otherwise. Returns 0 when the
+ * link is free for this fire's exchanges, <0 when the previous exchange is
+ * still in flight (the fire is skipped, like an EXI INT timeout). */
+static s32 ra_snap_collect(void)
+{
+	s32 ret;
+
+	if (!ra_usb_posted())
+		return 0;
+	ret = ra_usb_reap(RA_INT_TIMEOUT_MS);
+	if (ret == RA_USB_ETIMEOUT) {
+		g_to_phaseb++;
+		return ret;
+	}
+	if (ret == 0)
+		ra_parse_response(ra_snap_rx_buf);
+	return 0;   /* failed exchanges just lose that frame's reply */
+}
+#endif
 
 /* Send ADDR_RESPONSE for the currently pending query — read each addr from
  * PPC RAM, build the response, ship via Phase B. The response from ESP may
@@ -1652,6 +1746,22 @@ static s32 ra_send_addr_response(void)
 	return 0;
 }
 
+/* Phase D2 in-game RESYNC — re-fetch the full watchlist via chunks (~300ms
+ * of legacy round-trips, one-time repair) and adopt the ESP's seq base.
+ * Frames during the fetch are simply skipped; the next SNAPSHOT echoes the
+ * new seq and the ESP resumes verified-sync evaluation. */
+static void ra_do_resync(void)
+{
+	if (!ra_resync_pending)
+		return;
+	ra_resync_pending = 0;
+	if (ra_fetch_watchlist() == 0) {
+		ra_wl_seq = ra_resync_seq;
+	}
+	/* On fetch failure ra_wl_seq stays stale — the ESP sees the unchanged
+	 * echo and re-triggers the resync. */
+}
+
 /* (v0.26.2: ra_led_encode_count removed — the decimal blink encode of the
  * watchlist count burned ~13s of boot; the ESP serial log carries it.) */
 
@@ -1703,6 +1813,41 @@ static u32 ra_poll_thread(void *arg)
 	Swi_LedOn();  ra_sleep(100);
 	Swi_LedOff();
 
+#if RA_LINK_USB
+	/* Find the adapter on USB (ven on base 58, oh0 on 38/56/57). It has been
+	 * attached since power-on — WiiFlow just talked to it — so this normally
+	 * succeeds at once; retry ~30 s for a slow re-enumeration after the IOS
+	 * reload. On failure the disc-slot LED says why (2 blinks = ven taken by
+	 * a USB drive on base 58, 3 = adapter not found) and the module carries
+	 * on to the fetch, which fails with the usual 7 fast blinks. */
+	{
+		s32 ur = -1, k, tries;
+		for (tries = 0; tries < 30; tries++) {
+			ur = ra_usb_init();
+			if (ur == 0)
+				break;
+			ra_sleep(500);
+		}
+		if (ur != 0) {
+			s32 code = (ur == -4) ? 2 : 3;
+			for (k = 0; k < code; k++) {
+				Swi_LedOn();  ra_sleep(250);
+				Swi_LedOff(); ra_sleep(250);
+			}
+			ra_sleep(1000);
+		}
+	}
+
+	/* IDENTIFY until it answers (proves both directions of the link). */
+	{
+		s32 k;
+		for (k = 0; k < 10 && !esp_present; k++) {
+			(void)ra_identify();
+			if (!esp_present)
+				ra_sleep(100);
+		}
+	}
+#else
 	/* Initialize EXI subsystem. Just reads HW_EXICTRL to confirm bus master
 	 * is on — actual transactions configure CSR per-call via exi_select. */
 	exi_init();
@@ -1710,6 +1855,7 @@ static u32 ra_poll_thread(void *arg)
 	/* One IDENTIFY round-trip to confirm EXI link is healthy. */
 	(void)ra_identify();
 	ra_sleep(100);
+#endif
 
 	/* WATCHLIST FETCH. ESP32 is in state GAME_LOADED at this point —
 	 * rcheevos has already loaded the achievement set and computed the
@@ -1870,6 +2016,26 @@ static u32 ra_poll_thread(void *arg)
 				u32 _maxw;
 #endif
 
+#if RA_LINK_USB && RA_USB_PIPELINE
+				/* USB pipeline: the reply to LAST fire's snapshot first (it may
+				 * carry ADDR_QUERY / watchlist mutations / a RESYNC), its
+				 * ADDR_RESPONSE rounds and resync next, and only then this
+				 * fire's snapshot goes on the wire — the same sequence the ESP
+				 * sees over EXI. Still in flight = skip the fire. */
+				if (ra_snap_collect() == 0) {
+#if RA_SPIKE_LOG
+					_maxw = 0;
+#endif
+					for (i = 0; i < 12 && ra_pending_query_count > 0; i++) {
+						(void)ra_send_addr_response();
+#if RA_SPIKE_LOG
+						if (g_t_wait_ms > _maxw) _maxw = g_t_wait_ms;
+#endif
+					}
+					ra_do_resync();
+					(void)ra_send_snapshot();
+				}
+#else
 				(void)ra_send_snapshot();
 #if RA_SPIKE_LOG
 				_maxw = g_t_wait_ms;
@@ -1880,6 +2046,7 @@ static u32 ra_poll_thread(void *arg)
 					if (g_t_wait_ms > _maxw) _maxw = g_t_wait_ms;
 #endif
 				}
+#endif
 
 #if RA_SPIKE_LOG
 				/* Spike forensics: dump ONLY when this fire's convergence ran
@@ -1948,19 +2115,9 @@ static u32 ra_poll_thread(void *arg)
 #endif
 			}
 
-			/* Phase D2 in-game RESYNC — re-fetch the full watchlist via
-			 * chunks (~300ms of legacy round-trips, one-time repair) and
-			 * adopt the ESP's seq base. Frames during the fetch are simply
-			 * skipped; the next SNAPSHOT echoes the new seq and the ESP
-			 * resumes verified-sync evaluation. */
-			if (ra_resync_pending) {
-				ra_resync_pending = 0;
-				if (ra_fetch_watchlist() == 0) {
-					ra_wl_seq = ra_resync_seq;
-				}
-				/* On fetch failure ra_wl_seq stays stale — the ESP sees
-				 * the unchanged echo and re-triggers the resync. */
-			}
+#if !(RA_LINK_USB && RA_USB_PIPELINE)
+			ra_do_resync();   /* (USB pipeline: done before the snapshot post) */
+#endif
 
 			/* Diag every ~5s: counter value + fires + how many came from
 			 * the VBI edge (vs timer fallback). "VBI c=xxxxxxxx f=N v=M":
@@ -2085,7 +2242,18 @@ static s32 __RA_Initialize(u32 *queuehandle)
 	ret = os_message_queue_create(buffer, 8);
 	if (ret < 0) return ret;
 
+#if RA_LINK_USB
+	{
+		/* The EXI build registers DEVICE_NAME with .rodata zeroed by the
+		 * SADDR strip, i.e. an empty name — and that is the behaviour the
+		 * field has validated. The USB build keeps .rodata; keep the name
+		 * empty too. */
+		static char no_name[4] __attribute__((aligned(4)));
+		os_device_register(no_name, ret);
+	}
+#else
 	os_device_register(DEVICE_NAME, ret);
+#endif
 	*queuehandle = ret;
 	return 0;
 }
@@ -2188,3 +2356,5 @@ int main(void)
 
 	return 0;
 }
+
+#endif /* !RA_BUILD_USB_PROBE */
