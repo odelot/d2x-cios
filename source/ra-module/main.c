@@ -1769,6 +1769,13 @@ static u32 ra_poll_thread(void *arg)
 {
 	(void)arg;
 
+#if RA_LINK_USB
+	/* First thing, game or not: on 38/56/57 this is what makes the adapter
+	 * visible on USB at all — to WiiFlow's probe on its own IOS, and to
+	 * ra_usb_init below in the game's (see ra_usb_kick_ehci). */
+	ra_usb_kick_ehci();
+#endif
+
 	/* LED language since v0.26.2 (the boot blink theater was removed):
 	 * 1 blip = game detected, 2 blips = watchlist fetched,
 	 * 7 fast blinks = fetch error, 3 pulses = achievement unlock. */

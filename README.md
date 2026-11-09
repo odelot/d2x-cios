@@ -27,7 +27,7 @@ A single new module, [`source/ra-module/`](source/ra-module/), plus its build/pa
 | `source/ra-module/exi.c` | **Memory card link** (legacy build). Starlet-side EXI driver for the real Hollywood controller (`0x0d806800`): kernel-batched immediate transfers through MLOAD SWIs, plus the INT-line ("Phase B") handshake. |
 | `source/ra-module/vi.c` / `led.c` | HW_TIMER helpers and disc-slot LED control. |
 | `source/ra-module/gc_ra_protocol.h` | Shared binary protocol (kept in sync with the copy in wii-ra-adapter). |
-| `maked2x.sh` / `data/ciosmaps.xml` | `ra-module` is built as **RAMOD** and injected as an extra content into the **base IOS38, IOS56, IOS57 and IOS58** maps, so it ships inside the standard cIOS slots (248–251). |
+| `maked2x.sh` / `data/ciosmaps.xml` / `data/ciosmaps-vWii.xml` | `ra-module` is built as **RAMOD** and injected as an extra content into the **base IOS38, IOS56, IOS57 and IOS58** maps, for both the Wii and the Wii U's vWii, so it ships inside the standard cIOS slots (248–251). |
 
 The module runs on **Starlet** (the Wii's ARM security processor) *inside* the cIOS, next to the
 running game — which is what lets it read the game's RAM live, with zero game patching.
@@ -39,6 +39,8 @@ running game — which is what lets it read the game's RAM live, with zero game 
 At boot the module does **nothing** — it silently polls a frame counter at physical MEM1 address
 `0x2FF8`. That counter only advances when WiiFlow has injected its Gecko C0 VBlank hook and an
 RA-enabled game is actually running. Until then the module never touches the adapter link.
+The one thing it does first, before waiting, is open and close `/dev/usb2` once (see the USB
+link's *EHCI handoff* below). That talks to the cIOS's own USB module, not to the adapter.
 
 This single property is what makes it safe to install RAMOD into the standard cIOS slots
 (248–251), including the mainIOS WiiFlow itself runs under: while WiiFlow browses menus the
@@ -94,6 +96,14 @@ The RA protocol did not change for USB — only the wire. The rules, all found o
   list (`GETDEVICECHANGE`, kept pending across retries) and picks `303A:4052`. On bases 38/56/57
   that API does not exist and the module opens `/dev/usb/oh0/303a/4052` (USBV0) directly. USBV5
   device ids have bit 31 set — treat "found" as a flag, never as `id >= 0`.
+- **EHCI handoff.** On bases 38/56/57 the d2x EHCI module takes every USB port when the IOS
+  starts. It hands a full-speed device such as the ESP32-S3 over to the OHCI (where `oh0` can see
+  it) only while it scans the ports, and it scans only on the **first open of `/dev/usb2`**. A
+  loader that mounts a USB drive does that open, but WiiFlow with *Mount SD only*, SD/disc games
+  and the Wii U's vWii setup never do, so the adapter stayed invisible. The module therefore
+  opens and closes `/dev/usb2` as soon as its thread starts (`ra_usb_kick_ehci`, retrying while
+  the EHCI module registers). On base 58 `/dev/usb2` is the USBS module and the open does nothing,
+  so the single-client `ven` stays free.
 - **One reply per request.** Every request is one bulk OUT message and gets exactly one bulk IN
   reply holding the bytes an EXI read would have returned, so `main.c` keeps its EXI-shaped calls.
   The reply read is posted *before* the request so it is waiting when the ESP32 answers.
@@ -174,6 +184,19 @@ The RAMOD module is built and packaged automatically via `data/ciosmaps.xml`.
 Install the resulting cIOS with the usual d2x installer flow (bases 38/56/57/58 → slots 248–251) —
 pre-built packages are published in the
 [wii-ra-adapter releases](https://github.com/odelot/wii-ra-adapter/releases).
+
+The Wii and the Wii U need **different installers**, and the same `build/d2x-v999-usb/` modules go
+into both:
+
+- **Wii:** the regular d2x installer, with `build/ciosmaps.xml` (from `data/ciosmaps.xml`).
+- **Wii U (vWii):** *d2x cIOS installer for vWii*. It reads `ciosmaps.xml` from its own app folder,
+  so ship it the `d2x-v999-usb` group of `build/ciosmaps-vWii.xml` (from `data/ciosmaps-vWii.xml`)
+  under that name, with the modules in `<app folder>/d2x-v999-usb/`. It builds the cIOS from vWii
+  base IOS WADs on the SD card instead of downloading them.
+
+Never run the Wii installer on a Wii U, or the vWii one on a Wii. Each installs a cIOS built from
+the other console's IOS files, and [wii.hacks.guide](https://wii.hacks.guide/cios) warns that
+installing a Wii IOS on the vWii, or a vWii IOS on a Wii, "will likely brick your console".
 
 ---
 
