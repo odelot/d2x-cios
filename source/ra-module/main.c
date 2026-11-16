@@ -930,7 +930,33 @@ static u32 ra_chain_combine(u32 pv, u32 o, u8 op)
  * this USER-mode thread. Field: MKW froze IOS (Wiimote + power dead, PPC
  * still rendering, SNAPs stop with no ADDR_QUERY before) at every race start,
  * with both the full and the trimmed set — load-independent, like a fault. */
-#define RA_MEM2_SAFE_HI  0x13400000u
+#define RA_MEM2_SAFE_HI_DEFAULT  0x13400000u
+/* 2026-11-15: the bound now comes from the running IOS. The Wii OS globals at
+ * MEM1 0x3118-0x3134 (read on the console with Kirby RtDL / SMG / MKW / Kirby's
+ * Dream Collection, IOS 56/33/36 via d2x) say:
+ *   PPC end 0x93600000 | game arena 0x90000800-0x935E0000 | IPC 0x935E0000-0x93600000
+ * i.e. with this IOS the PPC owns MEM2 up to physical 0x13600000 (the 0x93400000
+ * above is the older-IOS layout). Kirby's Dream Collection keeps its sub-game
+ * selector at 0x135E1044 (in the PPC's IPC buffer), which the fixed 0x13400000
+ * bound read as 0 -> 278 of its 282 achievements could never fire. The MKW
+ * freeze came from the 0x13600000+ IOS-private range the old 0x13800000 bound
+ * let through; this bound still stops at the PPC end. Accepted only inside the
+ * known layouts [0x93400000, 0x93600000]; anything else keeps the old bound. */
+#define RA_MEM2_SAFE_HI_MAX      0x13600000u
+#define RA_OS_MEM2_END_PHYS      0x00003120u   /* OS global: end of PPC-addressable MEM2 */
+static u32 ra_mem2_safe_hi = RA_MEM2_SAFE_HI_DEFAULT;
+#define RA_MEM2_SAFE_HI  ra_mem2_safe_hi
+
+static void ra_mem2_bound_refresh(void)
+{
+	u32 v;
+	os_sync_before_read((void *)RA_OS_MEM2_END_PHYS, 4);
+	v = *(volatile u32 *)RA_OS_MEM2_END_PHYS;   /* virtual, e.g. 0x93600000 */
+	if (v >= 0x80000000u + RA_MEM2_SAFE_HI_DEFAULT && v <= 0x80000000u + RA_MEM2_SAFE_HI_MAX)
+		ra_mem2_safe_hi = v - 0x80000000u;
+	else
+		ra_mem2_safe_hi = RA_MEM2_SAFE_HI_DEFAULT;
+}
 
 /* Same MEM1/MEM2 guard as the ESP collect: a wild deref can hang the
  * Starlet thread (SVC data abort — [[project_vi_probe_crashed_kernel]]). */
@@ -1272,6 +1298,96 @@ static u32 ra_frame_counter = 0;
  * snapshots. */
 static u32 ra_game_frame = 0;
 
+/* Slow-hook escape from the game-alive gate (see ra_poll_thread). */
+#define RA_GATE_GRACE_TICKS  160u   /* x 50 ms = 8 s after the booter crumb */
+static u32 ra_gate_changes = 0;
+static u32 ra_gate_why = 0;
+static u32 ra_gate_ticks = 0;
+static u32 ra_gate_code = 0;    /* where the RA C0 code was found (0 = not) */
+
+/* Booter breadcrumbs (WiiFlow apploader.c): 0x2FE0 = 0x5242hhpp,
+ * 0x2FE4 = GCT size, 0x2FE8 = VI hook branch address, 0x2FEC = multi-DOL
+ * branch address. */
+#define RA_CRUMB_PHYS        0x00002FE0u
+#define RA_CODEHANDLER_PHYS  0x000018A8u
+
+/* Post-mortem words at MEM1 0x2FC0 (2026-11-14). Written only after the
+ * gate opened in a game IOS, so they survive the session; WiiFlow logs them
+ * on its next start ("[PM] ra-module:" in sd:/ra_exi_debug.txt) — the only
+ * trace left when the USB link itself is what failed. */
+#define RA_PM_PHYS    0x00002FC0u
+#define RA_PM_MAGIC   0x5241504Du   /* 'RAPM' */
+enum { PM_MAGIC = 0, PM_STAGE, PM_GATE, PM_USB, PM_TRIES, PM_ESP, PM_FIRES, PM_UERR };
+/* PM_STAGE: 02 gate open, 03 USB open, 04 ESP identified, 05 watchlist ok,
+ * 06 main loop; E2/E3 USB init failing (ven taken / not found), E4 USB open
+ * but no IDENTIFY answer, E5 watchlist fetch failed. */
+
+static u32 ra_pm_stage = 0;
+
+static void ra_pm_put(u32 idx, u32 v)
+{
+	u32 a = RA_PM_PHYS + idx * 4u;
+	if (idx == PM_STAGE)
+		ra_pm_stage = v;
+	*(volatile u32 *)a = v;
+	os_sync_after_write((void *)a, 4);
+}
+
+/* Read one word of PPC MEM1 by effective address (0x80…/0xC0…), with the
+ * range checked first — never dereference an unvalidated address on
+ * Starlet ([[project-vi-probe-crashed-kernel]]). 0xFFFFFFFF = not MEM1. */
+static u32 ra_ppc_word(u32 ea)
+{
+	u32 pa;
+	if ((ea & 0xF0000000u) != 0x80000000u && (ea & 0xF0000000u) != 0xC0000000u)
+		return 0xFFFFFFFFu;
+	pa = ea & 0x0FFFFFFFu;
+	if (pa >= 0x01800000u || (pa & 3u))
+		return 0xFFFFFFFFu;
+	os_sync_before_read((void *)pa, 4);
+	return *(volatile u32 *)pa;
+}
+
+/* The word patchhook should have left at the hook site: b 0x800018A8. */
+static u32 ra_hook_expected(u32 at)
+{
+	return 0x48000000u | ((0x800018A8u - at) & 0x03FFFFFCu);
+}
+
+/* Physical address of WiiFlow's RA VBI C0 code in the codelist region, or 0.
+ * Only WiiFlow's RA boot path injects it (fst.c ocarina_load_code), so it
+ * tells "RA game booted" apart from a plain/cheats boot.
+ *
+ * Matches the counter increment itself, whatever the variant:
+ *   lwz rX,0x2FF8(rA) ; addi rX,rX,1 ; stw rX,0x2FF8(rA)
+ * The counter-only hook uses r12/r11 (818B2FF8 398C0001 918B2FF8), the
+ * trophy-overlay hook — the one WiiFlow ships — r3/r12 (806C2FF8 38630001
+ * 906C2FF8). The first version (2026-11-14) matched only the counter-only
+ * words, so the escape could never fire with the shipped hook; the
+ * forced-escape test build caught it on hardware. */
+static u32 ra_gct_find_ra_code(void)
+{
+	const u32 lo = 0x00001800u, hi = RA_VBI_COUNTER_PHYS;
+	u32 a;
+	os_sync_before_read((void *)lo, hi - lo);
+	for (a = lo; a + 12 <= hi; a += 4) {
+		u32 w0 = *(volatile u32 *)a;
+		u32 w1, w2, rd;
+		if ((w0 & 0xFC00FFFFu) != 0x80002FF8u)      /* lwz rX,0x2FF8(rA) */
+			continue;
+		w1 = *(volatile u32 *)(a + 4);
+		w2 = *(volatile u32 *)(a + 8);
+		rd = w0 & 0x03E00000u;
+		if ((w1 & 0xFC00FFFFu) == 0x38000001u &&    /* addi rX,rX,1 */
+		    (w1 & 0x03E00000u) == rd &&
+		    (w1 & 0x001F0000u) == (rd >> 5) &&      /* ...its rA = rX */
+		    (w2 & 0xFC00FFFFu) == 0x90002FF8u &&    /* stw rX,0x2FF8(rA) */
+		    (w2 & 0x03FF0000u) == (w0 & 0x03FF0000u))
+			return a;
+	}
+	return 0;
+}
+
 /* Phase D2 (v0.26.0) — verified watchlist sync. ra_wl_seq is the seq of
  * the last mutation we APPLIED; echoed in every SNAPSHOT header so the
  * ESP knows our exact position in its mutation stream. We apply a
@@ -1518,6 +1634,14 @@ static s32 ra_send_snapshot(void)
 
 	u16 win_first = 0, win_count = 0;
 	u32 blob_len = 0, bm_bytes = 0;
+
+	/* MEM2 read bound from the OS global (cheap MEM1 read; ~1 s cadence so a
+	 * game that boots under another IOS is picked up) */
+	{
+		static u32 bound_tick = 0;
+		if ((bound_tick++ % 60u) == 0u)
+			ra_mem2_bound_refresh();
+	}
 
 	hdr = (ra_gc_header_t *)ra_snap_tx_buf;
 	hdr->magic       = RA_MAGIC_GC_TO_ESP;
@@ -1769,6 +1893,13 @@ static u32 ra_poll_thread(void *arg)
 {
 	(void)arg;
 
+	/* Clear the booter crumb BEFORE anything that can take time (the EHCI
+	 * kick retries up to ~3 s): its reappearance is the gate's "a game was
+	 * booted on this IOS" signal, so it must be cleared before the booter
+	 * can possibly write it. Plain MEM1 store — safe at any point. */
+	*(volatile u32 *)RA_CRUMB_PHYS = 0;
+	os_sync_after_write((void *)RA_CRUMB_PHYS, 4);
+
 #if RA_LINK_USB
 	/* First thing, game or not: on 38/56/57 this is what makes the adapter
 	 * visible on USB at all — to WiiFlow's probe on its own IOS, and to
@@ -1800,20 +1931,63 @@ static u32 ra_poll_thread(void *arg)
 	 * without the ESP (WiiFlow doesn't inject the hook) and games where
 	 * the hook pattern fails also stay silent — acceptable: RA simply
 	 * isn't running for those. */
+	/* SLOW-HOOK ESCAPE (2026-11-14, MadWorld). The Ocarina "VBI" hook is
+	 * really on VISetNextFrameBuffer, not the retrace interrupt: games that
+	 * keep a fixed XFB (MadWorld swaps only on a few screens) bump the
+	 * counter once or twice and then never again → the gate above waited
+	 * forever and the ESP sat in spectator mode.
+	 *
+	 * Second exit (v2): we clear the booter crumb at 0x2FE0 here, at module
+	 * start. WiiFlow's booter rewrites it (0x5242hhpp) only when it launches
+	 * a game AFTER this IOS came up — so its reappearance proves "a game was
+	 * booted on this IOS", which never happens in WiiFlow's own IOS (that is
+	 * what keeps the module silent while WiiFlow browses). Crumb back + the
+	 * RA C0 code in the codelist (only WiiFlow's RA path injects it) +
+	 * RA_GATE_GRACE_TICKS → go live even if the counter NEVER moved (hook
+	 * not patched / not running), and the VBIGATE line reports why. The main
+	 * loop then runs on its 2-frame timer fallback with a wall-clock frame
+	 * clock. */
 	{
-		u32 prev, cur;
+		u32 prev, cur, crumb;
 		s32 changes = 0;
+		u32 ticks = 0, crumb_tick = 0;
+		u32 why = 0;   /* 1 = 4 changes, 2 = crumb + RA code + grace */
+
+		/* (crumb already cleared at thread start) */
 		os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
 		prev = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
-		while (changes < 4) {
+		while (!why) {
 			ra_sleep(50);
+			ticks++;
 			os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
 			cur = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
 			if (cur != prev) {
 				changes++;
 				prev = cur;
 			}
+			if (!RA_TEST_FORCE_ESCAPE && changes >= 4) {
+				why = 1;
+				break;
+			}
+			if (!crumb_tick) {
+				os_sync_before_read((void *)RA_CRUMB_PHYS, 4);
+				crumb = *(volatile u32 *)RA_CRUMB_PHYS;
+				if ((crumb >> 16) == 0x5242u)
+					crumb_tick = ticks;
+			} else if (ticks - crumb_tick >= RA_GATE_GRACE_TICKS &&
+			           ((ticks - crumb_tick) % 20u) == 0) {
+				/* Not an RA boot (no RA code) → stays silent for good. */
+				ra_gate_code = ra_gct_find_ra_code();
+				if (ra_gate_code)
+					why = 2;
+			}
 		}
+		ra_gate_changes = (u32)changes;
+		ra_gate_why = why;
+		ra_gate_ticks = ticks;
+		ra_pm_put(PM_MAGIC, RA_PM_MAGIC);
+		ra_pm_put(PM_STAGE, 0x02);
+		ra_pm_put(PM_GATE, (why << 24) | ((u32)changes & 0xFFFFFFu));
 	}
 
 	/* Single short blip: ra-module alive, game detected. */
@@ -1825,34 +1999,53 @@ static u32 ra_poll_thread(void *arg)
 	 * attached since power-on — WiiFlow just talked to it — so this normally
 	 * succeeds at once; retry ~30 s for a slow re-enumeration after the IOS
 	 * reload. On failure the disc-slot LED says why (2 blinks = ven taken by
-	 * a USB drive on base 58, 3 = adapter not found) and the module carries
-	 * on to the fetch, which fails with the usual 7 fast blinks. */
+	 * a USB drive on base 58, 3 = adapter not found, 4 = USB open but the
+	 * ESP never answered IDENTIFY).
+	 *
+	 * Safeguard (2026-11-14): no longer gives up after one round — an RA game
+	 * was booted on this IOS, so the adapter is expected; keep retrying
+	 * (1 s, then 5 s apart) until IDENTIFY answers, recording each stage in
+	 * the post-mortem words. The old flow carried on into a fetch and a main
+	 * loop with a dead link — indistinguishable from "gate never opened" in
+	 * the ESP log. */
 	{
-		s32 ur = -1, k, tries;
-		for (tries = 0; tries < 30; tries++) {
-			ur = ra_usb_init();
-			if (ur == 0)
-				break;
-			ra_sleep(500);
-		}
-		if (ur != 0) {
-			s32 code = (ur == -4) ? 2 : 3;
-			for (k = 0; k < code; k++) {
-				Swi_LedOn();  ra_sleep(250);
-				Swi_LedOff(); ra_sleep(250);
+		s32 ur = -1, k, t;
+		u32 tries = 0, round = 0;
+		while (!esp_present) {
+			for (t = 0; t < 30; t++) {
+				ur = ra_usb_init();
+				tries++;
+				ra_pm_put(PM_USB, (u32)ur);
+				ra_pm_put(PM_TRIES, tries);
+				if (ur == 0)
+					break;
+				ra_sleep(500);
 			}
-			ra_sleep(1000);
+			if (ur == 0) {
+				ra_pm_put(PM_STAGE, 0x03);
+				for (k = 0; k < 10 && !esp_present; k++) {
+					(void)ra_identify();
+					if (!esp_present)
+						ra_sleep(100);
+				}
+				if (esp_present)
+					break;
+			}
+			{
+				s32 code = (ur != 0) ? ((ur == -4) ? 2 : 3) : 4;
+				ra_pm_put(PM_STAGE, 0xE0u | (u32)code);
+				if (round < 10) {
+					for (k = 0; k < code; k++) {
+						Swi_LedOn();  ra_sleep(250);
+						Swi_LedOff(); ra_sleep(250);
+					}
+				}
+			}
+			round++;
+			ra_sleep(round < 10 ? 1000 : 5000);
 		}
-	}
-
-	/* IDENTIFY until it answers (proves both directions of the link). */
-	{
-		s32 k;
-		for (k = 0; k < 10 && !esp_present; k++) {
-			(void)ra_identify();
-			if (!esp_present)
-				ra_sleep(100);
-		}
+		ra_pm_put(PM_ESP, 1);
+		ra_pm_put(PM_STAGE, 0x04);
 	}
 #else
 	/* Initialize EXI subsystem. Just reads HW_EXICTRL to confirm bus master
@@ -1864,6 +2057,60 @@ static u32 ra_poll_thread(void *arg)
 	ra_sleep(100);
 #endif
 
+	/* One line on how the game-alive gate opened (always sent — it is the
+	 * only trace of a slow/dead VBI hook): why=1 normal (4 changes), why=2
+	 * slow-hook escape. c = counter, rb = booter breadcrumb 0x5242hhpp
+	 * (hh hooktype, pp hookpatched), gsz = GCT size the booter received. */
+	/* v2 adds: t = seconds in the gate, vih = where the booter wrote the VI
+	 * hook branch (0 = pattern never found) and hk = the word there NOW
+	 * (OK = still "b 0x800018A8", else the raw word — overwritten),
+	 * mdh = multi-DOL branch address, ch = first codehandler word (0 = no
+	 * codehandler installed). */
+	{
+		u8 m[200];
+		u32 o = 0, v, vih;
+		const char *t = "VBIGATE why=";
+		while (*t) m[o++] = (u8)*t++;
+		o += ra_dbg_u16_dec(m + o, (u16)ra_gate_why);
+		t = " chg="; while (*t) m[o++] = (u8)*t++;
+		o += ra_dbg_u16_dec(m + o, (u16)ra_gate_changes);
+		t = " t="; while (*t) m[o++] = (u8)*t++;
+		o += ra_dbg_u16_dec(m + o, (u16)(ra_gate_ticks / 20u));
+		os_sync_before_read((void *)RA_CRUMB_PHYS, 0x20);
+		t = " c="; while (*t) m[o++] = (u8)*t++;
+		v = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
+		o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+		t = " rb="; while (*t) m[o++] = (u8)*t++;
+		v = *(volatile u32 *)RA_CRUMB_PHYS;
+		o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+		t = " gsz="; while (*t) m[o++] = (u8)*t++;
+		v = *(volatile u32 *)(RA_CRUMB_PHYS + 4);
+		o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+		t = " vih="; while (*t) m[o++] = (u8)*t++;
+		vih = *(volatile u32 *)(RA_CRUMB_PHYS + 8);
+		o += ra_dbg_hex_bytes(m + o, (const u8 *)&vih, 4, 0);
+		t = " hk="; while (*t) m[o++] = (u8)*t++;
+		v = vih ? ra_ppc_word(vih) : 0;
+		if (vih && v == ra_hook_expected(vih)) {
+			m[o++] = 'O'; m[o++] = 'K';
+		} else {
+			o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+		}
+		t = " mdh="; while (*t) m[o++] = (u8)*t++;
+		v = *(volatile u32 *)(RA_CRUMB_PHYS + 12);
+		o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+		t = " ch="; while (*t) m[o++] = (u8)*t++;
+		os_sync_before_read((void *)RA_CODEHANDLER_PHYS, 4);
+		v = *(volatile u32 *)RA_CODEHANDLER_PHYS;
+		o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+		/* rc = physical address of the RA C0 counter code (0 = not found:
+		 * the escape could not have fired). */
+		t = " rc="; while (*t) m[o++] = (u8)*t++;
+		v = ra_gate_code ? ra_gate_code : ra_gct_find_ra_code();
+		o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+		ra_debug_send_always(m, (u8)o);
+	}
+
 	/* WATCHLIST FETCH. ESP32 is in state GAME_LOADED at this point —
 	 * rcheevos has already loaded the achievement set and computed the
 	 * addresses to watch. We pull them in chunks of up to 1024. */
@@ -1874,11 +2121,13 @@ static u32 ra_poll_thread(void *arg)
 			/* Fetch failed. 7 fast blinks = error (kept — this is the
 			 * one signal worth reading off the LED in the field). */
 			int k;
+			ra_pm_put(PM_STAGE, 0xE5);
 			for (k = 0; k < 7; k++) {
 				Swi_LedOn();  ra_sleep(120);
 				Swi_LedOff(); ra_sleep(120);
 			}
 		} else {
+			ra_pm_put(PM_STAGE, 0x05);
 			/* Success — double blip and straight into the main loop.
 			 * (v0.26.2: the old 5-blink + 1s marker + decimal LED count
 			 * encode burned ~13 MORE seconds before the first SNAPSHOT;
@@ -1940,11 +2189,15 @@ static u32 ra_poll_thread(void *arg)
 		u32 last_fire_tick;
 		u32 fires = 0, vbi_fires = 0;
 		u32 last_diag_tick;
+		u32 last_change_tick, synth_frame, synth_us_acc = 0;
+		u32 vbi_dead = 0, vbi_dead_logs = 0;
 
 		os_sync_before_read((void *)RA_VBI_COUNTER_PHYS, 4);
 		last_ctr = *(volatile u32 *)RA_VBI_COUNTER_PHYS;
+		synth_frame = last_ctr;
 		last_fire_tick = vi_read_hw_timer();
 		last_diag_tick = last_fire_tick;
+		last_change_tick = last_fire_tick;
 
 		while (1) {
 			s32 i;
@@ -1999,14 +2252,61 @@ static u32 ra_poll_thread(void *arg)
 			now_tick = vi_read_hw_timer();
 			diff_us = vi_ticks_to_us(now_tick - last_fire_tick);
 
-			if (ctr != last_ctr) {
+			if (!RA_TEST_FORCE_ESCAPE && ctr != last_ctr) {
+				u32 d = ctr - last_ctr;
+				/* A wild jump (booter re-zero, game reset) counts as 1. */
+				synth_frame += (d > 0 && d < 600u) ? d : 1u;
 				last_ctr = ctr;
+				last_change_tick = now_tick;
 				fire_now = 1;
 				vbi_fires++;
+				if (vbi_dead) {
+					vbi_dead = 0;
+					if (vbi_dead_logs < 6) {
+						static const u8 msg[] = "VBI alive again (hook clock)";
+						vbi_dead_logs++;
+						ra_debug_send_always(msg, sizeof(msg) - 1);
+					}
+				}
 			} else if (diff_us > (FRAME_US * FALLBACK_FACTOR)) {
 				fire_now = 1;
+				/* Slow/dead hook (MadWorld-class games: the "VBI" hook is on
+				 * VISetNextFrameBuffer): after 0.5 s without a change, the
+				 * frame clock follows wall time so ESP timers, LRU aging and
+				 * warm-up keep moving. Live hooks are untouched (deltas). */
+				if (!vbi_dead &&
+				    vi_ticks_to_us(now_tick - last_change_tick) >= 500000u) {
+					vbi_dead = 1;
+					synth_us_acc = 0;
+					if (vbi_dead_logs < 6) {
+						/* c = counter, hk = word at the hook site now
+						 * (OK = branch intact) — tells "hook overwritten"
+						 * from "hooked function just not being called". */
+						u8 m[64];
+						u32 o = 0, v, vih;
+						const char *t = "VBI dead 500ms -> wall-clock frames c=";
+						while (*t) m[o++] = (u8)*t++;
+						o += ra_dbg_hex_bytes(m + o, (const u8 *)&ctr, 4, 0);
+						t = " hk="; while (*t) m[o++] = (u8)*t++;
+						os_sync_before_read((void *)(RA_CRUMB_PHYS + 8), 4);
+						vih = *(volatile u32 *)(RA_CRUMB_PHYS + 8);
+						v = vih ? ra_ppc_word(vih) : 0;
+						if (vih && v == ra_hook_expected(vih)) {
+							m[o++] = 'O'; m[o++] = 'K';
+						} else {
+							o += ra_dbg_hex_bytes(m + o, (const u8 *)&v, 4, 0);
+						}
+						vbi_dead_logs++;
+						ra_debug_send_always(m, (u8)o);
+					}
+				}
+				if (vbi_dead) {
+					synth_us_acc += diff_us;
+					synth_frame  += synth_us_acc / FRAME_US;
+					synth_us_acc %= FRAME_US;
+				}
 			}
-			ra_game_frame = last_ctr;  /* true game-frame clock (v0.26.1) */
+			ra_game_frame = synth_frame;  /* game-frame clock (v0.26.1; synth 2026-11-14) */
 
 			if (!fire_now) {
 				ra_sleep(VBI_POLL_MS);
@@ -2015,6 +2315,12 @@ static u32 ra_poll_thread(void *arg)
 
 			last_fire_tick = now_tick;
 			fires++;
+			if ((fires & 63u) == 1u) {   /* post-mortem liveness, ~2 s */
+				if (ra_pm_stage == 0x05)
+					ra_pm_put(PM_STAGE, 0x06);
+				ra_pm_put(PM_FIRES, fires);
+				ra_pm_put(PM_UERR, g_to_phaseb + g_to_dbg);
+			}
 
 			{
 #if RA_SPIKE_LOG

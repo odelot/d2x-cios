@@ -23,7 +23,7 @@ A single new module, [`source/ra-module/`](source/ra-module/), plus its build/pa
 |---|---|
 | `source/ra-module/main.c` | The module itself: game-alive detection, watchlist state machine, pointer-chain walker, and the per-frame SNAPSHOT loop. Transport-agnostic: the same protocol runs over USB or EXI. |
 | `source/ra-module/usb_link.c` / `usb_link.h` | **USB link** (default). Finds the adapter (VID:PID `303A:4052`) through the IOS USB stack — `/dev/usb/ven` (USBV5) on base 58, `/dev/usb/oh0/303a/4052` (USBV0) on bases 38/56/57 — and runs bulk exchanges with timeouts, including the pipelined snapshot post/reap. |
-| `source/ra-module/ra_build.h` | Build switches: `RA_LINK_USB` (set by `make USB=1`) and `RA_USB_PIPELINE`. |
+| `source/ra-module/ra_build.h` | Build switches: `RA_LINK_USB` (set by `make USB=1`), `RA_USB_PIPELINE`, and the test-only `RA_TEST_FORCE_ESCAPE` (set by `make RA_TEST=1`, see *Slow-hook escape*). |
 | `source/ra-module/exi.c` | **Memory card link** (legacy build). Starlet-side EXI driver for the real Hollywood controller (`0x0d806800`): kernel-batched immediate transfers through MLOAD SWIs, plus the INT-line ("Phase B") handshake. |
 | `source/ra-module/vi.c` / `led.c` | HW_TIMER helpers and disc-slot LED control. |
 | `source/ra-module/gc_ra_protocol.h` | Shared binary protocol (kept in sync with the copy in wii-ra-adapter). |
@@ -48,6 +48,22 @@ counter never moves, so there is no contention with WiiFlow's own probe/`LOAD_GA
 Boots without the adapter, or games where the hook pattern fails, also stay silent — RA simply
 isn't active for those.
 
+#### Slow-hook escape
+
+In some games the function WiiFlow hooks is barely called on certain screens (MadWorld's hook
+lands on `VISetNextFrameBuffer`), so the counter hardly moves and the gate never opened: the
+achievements loaded, but the adapter stayed in spectator mode. The gate now also opens when all
+three of these hold:
+
+1. WiiFlow's booter left its breadcrumb at MEM1 `0x2FE0` (`0x5242hhpp`): this is a WiiFlow boot;
+2. WiiFlow's RA counter code (`lwz`/`addi`/`stw` on `0x2FF8`) is in the codelist: RA is on;
+3. 8 s have passed since the module started.
+
+Without the RA code the module stays silent for good, as before. The breadcrumb is cleared at
+thread start, before anything slow, so a later boot never sees a stale one. The adapter log gets
+one line per boot on how the gate opened (`why=1` counter, `why=2` escape), with the time spent
+in the gate and the hook addresses WiiFlow recorded.
+
 ### Startup sequence (once the counter moves)
 
 1. **Link up + IDENTIFY** — the USB build finds the adapter on the IOS USB stack (see
@@ -68,10 +84,14 @@ Every frame, synchronized to the game's vertical retrace:
   line) and fires on change. If the counter stalls for 2 frame-times (loading screens, missing
   hook) a timer fallback fires on time and disengages the moment the counter moves again. The
   counter value doubles as the true game-frame clock shipped to the ESP32, so rcheevos
-  frame-based timers stay accurate.
+  frame-based timers stay accurate. When the hook is slow or dead (the escape case above), the
+  frame clock is synthesised from the timer instead, so the ESP32 still sees ~60 frames/s.
 - **Chain walk** — before sampling, the module *walks the pointer chains itself* using the
   Phase C table: dereferences roots in MEM1/MEM2, applies offsets/masks/arithmetic per node, and
-  collects always-fresh leaf values. Per-node previous/prior value histories ("Phase D") let
+  collects always-fresh leaf values. MEM2 reads stop at the end of PPC-addressable MEM2 as
+  reported by the running system (the OS global at `0x3120`, refreshed every ~60 snapshots and
+  accepted only within `0x93400000`–`0x93600000`): a fixed `0x13400000` limit, added after a read
+  past the end froze Mario Kart Wii, hid almost all of Kirby's Dream Collection's data. Per-node previous/prior value histories ("Phase D") let
   chains that reference rcheevos *delta*/*prior* values resolve on-console too — sound because
   the ESP32 queues snapshots so every walked frame is evaluated exactly once, making the
   walker's previous-walk value the evaluator's delta by definition. Verification values ship
@@ -146,6 +166,14 @@ The original transport, still built when `USB` is not set (`d2x-v999-test`):
 
 </details>
 
+### Post-mortem record
+
+While a game runs, the module keeps a few words at MEM1 `0x2FC0` (`'RAPM'`, the stage it reached,
+how the gate opened, the last USB init result and tries, whether the ESP32 answered, snapshot
+count, USB errors), refreshed about every 2 s. Low MEM1 usually survives a reset back to WiiFlow,
+which logs the record of the previous session to `sd:/ra_exi_debug.txt` — useful when a game
+never left spectator mode.
+
 ### Unlock celebration
 
 On an achievement event the module blinks the **disc-slot LED** (3 pulses) and raises a trophy
@@ -180,6 +208,9 @@ The RAMOD module is built and packaged automatically via `data/ciosmaps.xml`.
   does not forward environment variables, so with Docker pass it explicitly
   (`docker run ... -e USB=1 ... ./maked2x.sh 999 usb`).
 - **Memory card build (legacy):** `./maked2x.sh 999 test` → `build/d2x-v999-test/`.
+- **Escape test build (never ship):** set `RA_TEST=1` in the environment, like `USB=1` (with Docker: `-e RA_TEST=1`), to build with
+  `RA_TEST_FORCE_ESCAPE`, which ignores the VBI counter so the slow-hook escape can be proven on a
+  game whose hook works.
 
 Install the resulting cIOS with the usual d2x installer flow (bases 38/56/57/58 → slots 248–251) —
 pre-built packages are published in the
