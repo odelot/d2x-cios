@@ -34,6 +34,16 @@
 #define RA_LINK_USB  0
 #endif
 
+/* RA_TEST_FORCE_ESCAPE (default 0, TEST BUILDS ONLY): ignore the VBI
+ * counter everywhere — the gate can only open through the slow-hook
+ * escape (why=2) and the main loop runs as if the hook were dead
+ * (2-frame timer + wall-clock frame clock). Proves the MadWorld rescue
+ * path on hardware with a game whose hook works fine. Build with
+ * `-e RA_TEST=1` (Makefile). Never ship with it on. */
+#ifndef RA_TEST_FORCE_ESCAPE
+#define RA_TEST_FORCE_ESCAPE  0
+#endif
+
 #ifndef RA_USB_PIPELINE
 #define RA_USB_PIPELINE  1
 #endif

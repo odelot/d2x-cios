@@ -67,6 +67,7 @@ enum { BK_NONE = 0, BK_VEN, BK_OH0 };
 
 static const char ven_path[] __attribute__((aligned(32))) = "/dev/usb/ven";
 static const char oh0_path[] __attribute__((aligned(32))) = "/dev/usb/oh0/303a/4052";
+static const char usb2_path[] __attribute__((aligned(32))) = "/dev/usb2";
 
 /* One bulk request: everything IOS reads, each piece on its own 32-byte
  * line(s); 224 bytes keeps the alignment (usbprobe.c usbp_req_t). */
@@ -333,6 +334,28 @@ static s32 ven_find(s32 *dev_out)
 		os_ioctl(g_fd, USBV5_IOCTL_ATTACHFINISH, NULL, 0, NULL, 0);
 	}
 	return RA_USB_ETIMEOUT;
+}
+
+void ra_sleep(s32 time_ms);   /* main.c */
+
+/* The d2x EHCI module (bases 38/56/57) takes every port at IOS start and
+ * hands a full-speed device such as the ESP32-S3 to the OHCI only in its
+ * ehci_discover(), which runs on the first open of /dev/usb2. WiiFlow's USB
+ * mount does that open; with "SD only", or in a game booted from SD or disc,
+ * nobody does and the adapter never shows up on oh0 (Wii U, 2026-11-08: all
+ * four ports). On base 58 /dev/usb2 is d2x USBS, whose open does nothing. */
+void ra_usb_kick_ehci(void)
+{
+	s32 r, tries;
+
+	for (tries = 0; tries < 30; tries++) {
+		r = os_open(usb2_path, 0);
+		if (r >= 0) {
+			os_close(r);
+			return;
+		}
+		ra_sleep(100);   /* module not registered yet */
+	}
 }
 
 s32 ra_usb_init(void)

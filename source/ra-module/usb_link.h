@@ -19,6 +19,11 @@
 #define RA_USB_EDEAD      (-302)   /* link down (no device / post failed) */
 #define RA_USB_EBUF       (-303)   /* buffer not DMA-safe and too big to bounce */
 
+/* Open and close /dev/usb2 once (retried while the module isn't up yet), so
+ * the d2x EHCI module on 38/56/57 runs its port discovery and hands the
+ * full-speed adapter to the OHCI. Harmless on base 58 (USBS: open only). */
+void ra_usb_kick_ehci(void);
+
 /* Find the adapter (ven on base 58, oh0 on 38/56/57) and prove the link with
  * an IDENTIFY. Returns 0, or <0 when no adapter answered this round (the
  * caller retries). */

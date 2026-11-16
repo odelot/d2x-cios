@@ -41,6 +41,11 @@ CFLAGS	+=	-DRA_LINK_USB=1
 STRIP_ARGS	=
 endif
 
+# Test build that forces the slow-hook escape path (see ra_build.h).
+ifeq ($(RA_TEST),1)
+CFLAGS	+=	-DRA_TEST_FORCE_ESCAPE=1
+endif
+
 # Libraries
 LIBS	=	../cios-lib/cios-lib.a
 
